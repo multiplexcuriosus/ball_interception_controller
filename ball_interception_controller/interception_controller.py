@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import importlib
+import math
 from enum import Enum
-from typing import Any, Optional, Type
+from typing import Any, Dict, Optional, Tuple, Type
 
 import rclpy
 from action_msgs.msg import GoalStatus
@@ -43,6 +44,50 @@ def _load_action_type(type_string: str) -> Type[Any]:
     module_name, class_name = type_string.rsplit(".", 1)
     module = importlib.import_module(module_name)
     return getattr(module, class_name)
+
+
+def _all_finite(values: Tuple[float, ...]) -> bool:
+    return all(math.isfinite(v) for v in values)
+
+
+def _normalize_quaternion(
+    x: float,
+    y: float,
+    z: float,
+    w: float,
+) -> Optional[Tuple[float, float, float, float]]:
+    if not _all_finite((x, y, z, w)):
+        return None
+
+    norm = math.sqrt(x * x + y * y + z * z + w * w)
+    if norm <= 1e-12:
+        return None
+
+    inv = 1.0 / norm
+    return (x * inv, y * inv, z * inv, w * inv)
+
+
+def _quat_to_rot_matrix(
+    x: float,
+    y: float,
+    z: float,
+    w: float,
+) -> Tuple[Tuple[float, float, float], Tuple[float, float, float], Tuple[float, float, float]]:
+    xx = x * x
+    yy = y * y
+    zz = z * z
+    xy = x * y
+    xz = x * z
+    yz = y * z
+    wx = w * x
+    wy = w * y
+    wz = w * z
+
+    return (
+        (1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz), 2.0 * (xz + wy)),
+        (2.0 * (xy + wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx)),
+        (2.0 * (xz - wy), 2.0 * (yz + wx), 1.0 - 2.0 * (xx + yy)),
+    )
 
 
 class InterceptionController(Node):
@@ -106,6 +151,17 @@ class InterceptionController(Node):
         # cached for trajectory_timeout_sec. Ignore intercept poses briefly after reset.
         self.declare_parameter("post_reset_ignore_sec", 0.60)
 
+        self.declare_parameter(
+            "commanded_target_table_topic",
+            "/interception_controller/commanded_target_table",
+        )
+        self.declare_parameter(
+            "table_pose_robot_base_topic",
+            "/scene_localizer/table_pose_robot_base",
+        )
+        self.declare_parameter("table_frame", "table_frame")
+        self.declare_parameter("max_table_pose_age_sec", 1.0)
+
         self.declare_parameter("require_reset_service", True)
         self.declare_parameter("status_publish_rate_hz", 2.0)
         self.declare_parameter("debug_log", False)
@@ -129,6 +185,24 @@ class InterceptionController(Node):
         self._active_goal_handle: Optional[Any] = None
         self._active_command_v_max: Optional[float] = None
         self._active_command_a_max: Optional[float] = None
+        self._warn_throttle_last_sec: Dict[str, float] = {}
+
+        self._latest_table_t_base_table: Optional[Tuple[float, float, float]] = None
+        self._latest_table_r_base_table: Optional[
+            Tuple[Tuple[float, float, float], Tuple[float, float, float], Tuple[float, float, float]]
+        ] = None
+        self._latest_table_pose_header_stamp_sec: Optional[float] = None
+        self._latest_table_pose_receive_time_sec: Optional[float] = None
+        self._latest_table_pose_frame_id: str = ""
+
+        self._projection_request_generation: Optional[int] = None
+        self._projection_request_base_target_xyz: Optional[Tuple[float, float, float]] = None
+
+        self._pending_publish_generation: Optional[int] = None
+        self._pending_publish_target_s: Optional[float] = None
+        self._pending_publish_cross_track_error_m: Optional[float] = None
+        self._pending_publish_base_target_xyz: Optional[Tuple[float, float, float]] = None
+        self._pending_publish_table_target_xyz: Optional[Tuple[float, float, float]] = None
 
         self._reset_client = self.create_client(
             Trigger,
@@ -162,9 +236,21 @@ class InterceptionController(Node):
             10,
         )
 
+        self._table_pose_sub = self.create_subscription(
+            PoseStamped,
+            str(self.get_parameter("table_pose_robot_base_topic").value),
+            self._handle_table_pose_robot_base,
+            10,
+        )
+
         self._status_pub = self.create_publisher(
             String,
             "/interception_controller/status",
+            10,
+        )
+        self._commanded_target_table_pub = self.create_publisher(
+            PointStamped,
+            str(self.get_parameter("commanded_target_table_topic").value),
             10,
         )
 
@@ -180,6 +266,164 @@ class InterceptionController(Node):
             f"action={self.get_parameter('trajectory_action_name').value}, "
             f"action_type={action_type_string}"
         )
+
+    def _warn_throttled(self, key: str, msg: str, period_sec: float = 1.0) -> None:
+        now_sec = self._now_sec()
+        last_sec = self._warn_throttle_last_sec.get(key)
+        if last_sec is None or (now_sec - last_sec) >= period_sec:
+            self._warn_throttle_last_sec[key] = now_sec
+            self.get_logger().warn(msg)
+
+    def _clear_projection_request_cache(self, generation: Optional[int] = None) -> None:
+        if generation is not None and self._projection_request_generation != generation:
+            return
+        self._projection_request_generation = None
+        self._projection_request_base_target_xyz = None
+
+    def _clear_pending_publish_data(self, generation: Optional[int] = None) -> None:
+        if generation is not None and self._pending_publish_generation != generation:
+            return
+        self._pending_publish_generation = None
+        self._pending_publish_target_s = None
+        self._pending_publish_cross_track_error_m = None
+        self._pending_publish_base_target_xyz = None
+        self._pending_publish_table_target_xyz = None
+
+    def _cache_projection_request_target(self, generation: int, msg: PoseStamped) -> None:
+        p = msg.pose.position
+        self._projection_request_generation = generation
+        self._projection_request_base_target_xyz = (float(p.x), float(p.y), float(p.z))
+
+    def _resolve_projection_base_target(
+        self,
+        result: Any,
+        generation: int,
+    ) -> Optional[Tuple[float, float, float]]:
+        projected_point = getattr(result, "projected_point", None)
+        if projected_point is not None and hasattr(projected_point, "point"):
+            pp = projected_point.point
+            projected_xyz = (float(pp.x), float(pp.y), float(pp.z))
+            if _all_finite(projected_xyz):
+                return projected_xyz
+
+        if self._projection_request_generation == generation and self._projection_request_base_target_xyz is not None:
+            # ProjectPointToLine currently returns scalar s but no Cartesian projected point.
+            # We still send result.s as the actual CMD_GOTO_S command scalar.
+            # The published Cartesian point is then the requested middle-line intersection point,
+            # which may differ slightly from the executor's internal projected line point when
+            # cross-track error is nonzero.
+            return self._projection_request_base_target_xyz
+
+        return None
+
+    def _base_to_table_target(
+        self,
+        p_base: Tuple[float, float, float],
+    ) -> Optional[Tuple[float, float, float]]:
+        if self._latest_table_t_base_table is None or self._latest_table_r_base_table is None:
+            self._warn_throttled(
+                "table_pose_missing",
+                "skipping commanded_target_table publish: no valid table pose received yet",
+                period_sec=1.0,
+            )
+            return None
+
+        expected_base_frame = _clean_frame(str(self.get_parameter("expected_frame").value))
+        table_pose_frame = _clean_frame(self._latest_table_pose_frame_id)
+        if expected_base_frame and table_pose_frame and table_pose_frame != expected_base_frame:
+            self._warn_throttled(
+                "table_pose_frame_mismatch",
+                (
+                    "skipping commanded_target_table publish: table pose frame_id "
+                    f"'{table_pose_frame}' != expected base frame '{expected_base_frame}'"
+                ),
+                period_sec=1.0,
+            )
+            return None
+
+        now_sec = self._now_sec()
+        max_age_sec = max(0.0, float(self.get_parameter("max_table_pose_age_sec").value))
+        pose_time_sec = self._latest_table_pose_header_stamp_sec
+        if pose_time_sec is None or pose_time_sec <= 0.0:
+            pose_time_sec = self._latest_table_pose_receive_time_sec
+
+        if pose_time_sec is None:
+            self._warn_throttled(
+                "table_pose_no_timestamp",
+                "skipping commanded_target_table publish: table pose has no usable timestamp",
+                period_sec=1.0,
+            )
+            return None
+
+        age_sec = now_sec - pose_time_sec
+        if age_sec > max_age_sec:
+            self._warn_throttled(
+                "table_pose_stale",
+                (
+                    "skipping commanded_target_table publish: table pose is stale "
+                    f"age={age_sec:.3f}s max={max_age_sec:.3f}s"
+                ),
+                period_sec=1.0,
+            )
+            return None
+
+        tx, ty, tz = self._latest_table_t_base_table
+        px, py, pz = p_base
+        dx = px - tx
+        dy = py - ty
+        dz = pz - tz
+
+        r = self._latest_table_r_base_table
+        p_table = (
+            r[0][0] * dx + r[1][0] * dy + r[2][0] * dz,
+            r[0][1] * dx + r[1][1] * dy + r[2][1] * dz,
+            r[0][2] * dx + r[1][2] * dy + r[2][2] * dz,
+        )
+        if not _all_finite(p_table):
+            self._warn_throttled(
+                "table_transform_non_finite",
+                "skipping commanded_target_table publish: non-finite table-space target",
+                period_sec=1.0,
+            )
+            return None
+
+        return p_table
+
+    def _handle_table_pose_robot_base(self, msg: PoseStamped) -> None:
+        p = msg.pose.position
+        q = msg.pose.orientation
+        values = (
+            float(p.x),
+            float(p.y),
+            float(p.z),
+            float(q.x),
+            float(q.y),
+            float(q.z),
+            float(q.w),
+        )
+        if not _all_finite(values):
+            self._warn_throttled(
+                "table_pose_non_finite",
+                "ignoring non-finite table_pose_robot_base",
+                period_sec=1.0,
+            )
+            return
+
+        normalized = _normalize_quaternion(float(q.x), float(q.y), float(q.z), float(q.w))
+        if normalized is None:
+            self._warn_throttled(
+                "table_pose_zero_quat",
+                "ignoring table_pose_robot_base with zero-norm quaternion",
+                period_sec=1.0,
+            )
+            return
+
+        qx, qy, qz, qw = normalized
+        self._latest_table_t_base_table = (float(p.x), float(p.y), float(p.z))
+        self._latest_table_r_base_table = _quat_to_rot_matrix(qx, qy, qz, qw)
+        self._latest_table_pose_header_stamp_sec = self._stamp_to_sec(msg)
+        self._latest_table_pose_receive_time_sec = self._now_sec()
+        self._latest_table_pose_frame_id = msg.header.frame_id
 
     def _debug(self, msg: str) -> None:
         if bool(self.get_parameter("debug_log").value):
@@ -204,6 +448,8 @@ class InterceptionController(Node):
         self._active_goal_handle = None
         self._waiting_start_time_sec = None
         self._accept_after_time_sec = None
+        self._clear_projection_request_cache()
+        self._clear_pending_publish_data()
 
         if error:
             self._last_error = reason
@@ -233,6 +479,8 @@ class InterceptionController(Node):
         self._last_error = ""
         self._arm_time_sec = self._now_sec()
         self._active_goal_handle = None
+        self._clear_projection_request_cache()
+        self._clear_pending_publish_data()
 
         require_reset = bool(self.get_parameter("require_reset_service").value)
         reset_service_name = str(self.get_parameter("trajectory_reset_service").value)
@@ -296,13 +544,14 @@ class InterceptionController(Node):
             return response
 
         self._generation += 1
+        self._clear_projection_request_cache()
+        self._clear_pending_publish_data()
         self._freeze("disarmed by service call", error=False)
         response.success = True
         response.message = "Interception controller disarmed/frozen."
         return response
 
     def _handle_intercept_pose(self, msg: PoseStamped) -> None:
-        self.get_logger().info("In _handle_intercept_pose")
         if self._state != InterceptionState.ARMED_WAITING:
             return
 
@@ -349,12 +598,15 @@ class InterceptionController(Node):
         req.point.point = msg.pose.position
         req.max_cross_track_error_m = float(self.get_parameter("max_cross_track_error_m").value)
         req.allow_out_of_bounds = bool(self.get_parameter("allow_out_of_bounds_projection").value)
+        self._cache_projection_request_target(generation, msg)
 
         future = self._project_client.call_async(req)
         future.add_done_callback(lambda fut: self._on_projection_done(fut, generation))
 
     def _on_projection_done(self, future: Any, generation: int) -> None:
         if generation != self._generation:
+            self._clear_projection_request_cache(generation)
+            self._clear_pending_publish_data(generation)
             return
 
         try:
@@ -370,8 +622,29 @@ class InterceptionController(Node):
         if not bool(result.success):
             # Conservative behavior: do not freeze. Keep waiting for next valid intercept pose.
             self.get_logger().warn(f"projection rejected; waiting for next intercept pose: {result.message}")
+            self._clear_projection_request_cache(generation)
+            self._clear_pending_publish_data(generation)
             self._set_state(InterceptionState.ARMED_WAITING, "projection rejected; waiting again")
             return
+
+        base_target_xyz = self._resolve_projection_base_target(result, generation)
+        self._clear_projection_request_cache(generation)
+        if base_target_xyz is None:
+            self._warn_throttled(
+                "projection_base_target_missing",
+                "projection succeeded but no base target is available for commanded_target_table publication",
+                period_sec=1.0,
+            )
+            self._clear_pending_publish_data(generation)
+            self._send_goto_s_goal(float(result.s), generation)
+            return
+
+        table_target_xyz = self._base_to_table_target(base_target_xyz)
+        self._pending_publish_generation = generation
+        self._pending_publish_target_s = float(result.s)
+        self._pending_publish_cross_track_error_m = float(result.cross_track_error_m)
+        self._pending_publish_base_target_xyz = base_target_xyz
+        self._pending_publish_table_target_xyz = table_target_xyz
 
         self.get_logger().info(
             f"projection ok: s={result.s:.6f}, "
@@ -404,6 +677,7 @@ class InterceptionController(Node):
 
     def _send_goto_s_goal(self, s: float, generation: int) -> None:
         if generation != self._generation:
+            self._clear_pending_publish_data(generation)
             return
 
         if not self._action_client.wait_for_server(timeout_sec=0.2):
@@ -454,6 +728,7 @@ class InterceptionController(Node):
 
     def _on_goal_response(self, future: Any, generation: int) -> None:
         if generation != self._generation:
+            self._clear_pending_publish_data(generation)
             return
 
         try:
@@ -463,8 +738,36 @@ class InterceptionController(Node):
             return
 
         if goal_handle is None or not goal_handle.accepted:
+            self._clear_pending_publish_data(generation)
             self._freeze("trajectory executor rejected CMD_GOTO_S goal", error=True)
             return
+
+        if (
+            self._pending_publish_generation == generation
+            and self._pending_publish_table_target_xyz is not None
+            and self._pending_publish_base_target_xyz is not None
+            and self._pending_publish_target_s is not None
+            and self._pending_publish_cross_track_error_m is not None
+        ):
+            table_xyz = self._pending_publish_table_target_xyz
+            msg = PointStamped()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.header.frame_id = str(self.get_parameter("table_frame").value)
+            msg.point.x = table_xyz[0]
+            msg.point.y = table_xyz[1]
+            msg.point.z = table_xyz[2]
+            self._commanded_target_table_pub.publish(msg)
+
+            base_xyz = self._pending_publish_base_target_xyz
+            self.get_logger().info(
+                "published accepted CMD_GOTO_S target: "
+                f"s={self._pending_publish_target_s:.6f}, "
+                f"base=[{base_xyz[0]:.6f}, {base_xyz[1]:.6f}, {base_xyz[2]:.6f}], "
+                f"table=[{table_xyz[0]:.6f}, {table_xyz[1]:.6f}, {table_xyz[2]:.6f}], "
+                f"cross_track={self._pending_publish_cross_track_error_m:.6f}"
+            )
+
+        self._clear_pending_publish_data(generation)
 
         self._active_goal_handle = goal_handle
         self._set_state(InterceptionState.EXECUTING, "trajectory executor accepted goal")
@@ -474,6 +777,7 @@ class InterceptionController(Node):
 
     def _on_action_result(self, future: Any, generation: int) -> None:
         if generation != self._generation:
+            self._clear_pending_publish_data(generation)
             return
 
         try:
