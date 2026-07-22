@@ -5,7 +5,10 @@ from launch_ros.actions import Node
 
 
 def generate_launch_description() -> LaunchDescription:
+    node_name = LaunchConfiguration("node_name")
     intercept_pose_topic = LaunchConfiguration("intercept_pose_topic")
+    command_source = LaunchConfiguration("command_source")
+    dry_run = LaunchConfiguration("dry_run")
     trajectory_reset_service = LaunchConfiguration("trajectory_reset_service")
     project_point_service = LaunchConfiguration("project_point_service")
     trajectory_action_name = LaunchConfiguration("trajectory_action_name")
@@ -27,15 +30,25 @@ def generate_launch_description() -> LaunchDescription:
     require_reset_service = LaunchConfiguration("require_reset_service")
     status_publish_rate_hz = LaunchConfiguration("status_publish_rate_hz")
     debug_log = LaunchConfiguration("debug_log")
+    rollout_prediction_topic = LaunchConfiguration("rollout_prediction_topic")
+    rollout_execute_threshold = LaunchConfiguration("rollout_execute_threshold")
+    rollout_required_consecutive = LaunchConfiguration("rollout_required_consecutive")
+    rollout_max_prediction_gap_sec = LaunchConfiguration("rollout_max_prediction_gap_sec")
+    rollout_max_target_spread_m = LaunchConfiguration("rollout_max_target_spread_m")
+    rollout_post_arm_ignore_sec = LaunchConfiguration("rollout_post_arm_ignore_sec")
+    rollout_min_target_s_m = LaunchConfiguration("rollout_min_target_s_m")
+    rollout_max_target_s_m = LaunchConfiguration("rollout_max_target_s_m")
 
     interception_node = Node(
         package="ball_interception_controller",
         executable="interception_controller",
-        name="interception_controller",
+        name=node_name,
         output="screen",
         parameters=[
             {
                 "intercept_pose_topic": intercept_pose_topic,
+                "command_source": command_source,
+                "dry_run": dry_run,
                 "trajectory_reset_service": trajectory_reset_service,
                 "project_point_service": project_point_service,
                 "trajectory_action_name": trajectory_action_name,
@@ -57,6 +70,14 @@ def generate_launch_description() -> LaunchDescription:
                 "require_reset_service": require_reset_service,
                 "status_publish_rate_hz": status_publish_rate_hz,
                 "debug_log": debug_log,
+                "rollout_prediction_topic": rollout_prediction_topic,
+                "rollout_execute_threshold": rollout_execute_threshold,
+                "rollout_required_consecutive": rollout_required_consecutive,
+                "rollout_max_prediction_gap_sec": rollout_max_prediction_gap_sec,
+                "rollout_max_target_spread_m": rollout_max_target_spread_m,
+                "rollout_post_arm_ignore_sec": rollout_post_arm_ignore_sec,
+                "rollout_min_target_s_m": rollout_min_target_s_m,
+                "rollout_max_target_s_m": rollout_max_target_s_m,
             }
         ],
     )
@@ -64,9 +85,24 @@ def generate_launch_description() -> LaunchDescription:
     return LaunchDescription(
         [
             DeclareLaunchArgument(
+                "node_name",
+                default_value="interception_controller",
+                description="Node name for private interface namespacing.",
+            ),
+            DeclareLaunchArgument(
                 "intercept_pose_topic",
                 default_value="/scene/middle_line_intersection_pose_robot_base",
                 description="Pose topic with predicted middle-line intersection in robot base frame.",
+            ),
+            DeclareLaunchArgument(
+                "command_source",
+                default_value="scene",
+                description="Command source: scene or rollout.",
+            ),
+            DeclareLaunchArgument(
+                "dry_run",
+                default_value="true",
+                description="If true, publish selected goto-s but do not send trajectory action.",
             ),
             DeclareLaunchArgument(
                 "trajectory_reset_service",
@@ -121,6 +157,14 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("require_reset_service", default_value="true"),
             DeclareLaunchArgument("status_publish_rate_hz", default_value="2.0"),
             DeclareLaunchArgument("debug_log", default_value="false"),
+            DeclareLaunchArgument("rollout_prediction_topic", default_value="/act/intercept_prediction"),
+            DeclareLaunchArgument("rollout_execute_threshold", default_value="0.90"),
+            DeclareLaunchArgument("rollout_required_consecutive", default_value="3"),
+            DeclareLaunchArgument("rollout_max_prediction_gap_sec", default_value="0.25"),
+            DeclareLaunchArgument("rollout_max_target_spread_m", default_value="0.02"),
+            DeclareLaunchArgument("rollout_post_arm_ignore_sec", default_value="0.25"),
+            DeclareLaunchArgument("rollout_min_target_s_m", default_value="0.0"),
+            DeclareLaunchArgument("rollout_max_target_s_m", default_value="0.0"),
             interception_node,
         ]
     )

@@ -2,18 +2,21 @@
 
 from __future__ import annotations
 
+from collections import deque
 import importlib
 import math
+import statistics
+import threading
 from enum import Enum
-from typing import Any, Dict, Optional, Tuple, Type
+from typing import Any, Deque, Dict, Optional, Tuple, Type
 
 import rclpy
 from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import PointStamped, PoseStamped
 from rclpy.action import ActionClient
 from rclpy.node import Node
-from std_msgs.msg import String
-from std_srvs.srv import Trigger
+from std_msgs.msg import Float32MultiArray, Float64, String
+from std_srvs.srv import SetBool, Trigger
 
 from fr3_husky_msgs.srv import ProjectPointToLine
 
@@ -48,6 +51,16 @@ def _load_action_type(type_string: str) -> Type[Any]:
 
 def _all_finite(values: Tuple[float, ...]) -> bool:
     return all(math.isfinite(v) for v in values)
+
+
+def _require_in_range(name: str, value: float, minimum: float, maximum: float) -> None:
+    if value < minimum or value > maximum:
+        raise ValueError(f"{name} must be in [{minimum}, {maximum}], got {value}")
+
+
+def _require_minimum(name: str, value: float, minimum: float) -> None:
+    if value < minimum:
+        raise ValueError(f"{name} must be >= {minimum}, got {value}")
 
 
 def _normalize_quaternion(
@@ -95,7 +108,7 @@ class InterceptionController(Node):
     One-shot ball interception coordinator.
 
     Flow:
-      1. /interception_controller/arm
+            1. ~/arm
       2. call /ball_trajectory_estimator/reset
       3. wait for fresh /scene/middle_line_intersection_pose_robot_base
       4. call /trajectory_executor/project_point_to_line
@@ -111,6 +124,7 @@ class InterceptionController(Node):
             "intercept_pose_topic",
             "/scene/middle_line_intersection_pose_robot_base",
         )
+        self.declare_parameter("command_source", "scene")
         self.declare_parameter(
             "trajectory_reset_service",
             "/ball_trajectory_estimator/reset",
@@ -153,7 +167,7 @@ class InterceptionController(Node):
 
         self.declare_parameter(
             "commanded_target_table_topic",
-            "/interception_controller/commanded_target_table",
+            "~/commanded_target_table",
         )
         self.declare_parameter(
             "table_pose_robot_base_topic",
@@ -165,6 +179,15 @@ class InterceptionController(Node):
         self.declare_parameter("require_reset_service", True)
         self.declare_parameter("status_publish_rate_hz", 2.0)
         self.declare_parameter("debug_log", False)
+        self.declare_parameter("rollout_prediction_topic", "/act/intercept_prediction")
+        self.declare_parameter("rollout_execute_threshold", 0.90)
+        self.declare_parameter("rollout_required_consecutive", 3)
+        self.declare_parameter("rollout_max_prediction_gap_sec", 0.25)
+        self.declare_parameter("rollout_max_target_spread_m", 0.02)
+        self.declare_parameter("rollout_post_arm_ignore_sec", 0.25)
+        self.declare_parameter("rollout_min_target_s_m", -0.15)
+        self.declare_parameter("rollout_max_target_s_m", 0.15)
+        self.declare_parameter("dry_run", True)
 
         action_type_string = str(self.get_parameter("trajectory_action_type").value)
         try:
@@ -174,6 +197,11 @@ class InterceptionController(Node):
                 f"Failed to load trajectory_action_type='{action_type_string}'. "
                 "Fix the parameter to match your trajectory executor action type."
             ) from exc
+
+        self._command_source = self._validate_command_source()
+        self._validate_rollout_configuration(validate_bounds=False)
+        self._mode_lock = threading.Lock()
+        self._dry_run = bool(self.get_parameter("dry_run").value)
 
         self._state = InterceptionState.FROZEN
         self._generation = 0
@@ -186,6 +214,8 @@ class InterceptionController(Node):
         self._active_command_v_max: Optional[float] = None
         self._active_command_a_max: Optional[float] = None
         self._warn_throttle_last_sec: Dict[str, float] = {}
+        self._rollout_predictions: Deque[Tuple[float, float]] = deque()
+        self._rollout_last_receive_time_sec: Optional[float] = None
 
         self._latest_table_t_base_table: Optional[Tuple[float, float, float]] = None
         self._latest_table_r_base_table: Optional[
@@ -203,6 +233,7 @@ class InterceptionController(Node):
         self._pending_publish_cross_track_error_m: Optional[float] = None
         self._pending_publish_base_target_xyz: Optional[Tuple[float, float, float]] = None
         self._pending_publish_table_target_xyz: Optional[Tuple[float, float, float]] = None
+        self._selected_goto_s_publish_generation: Optional[int] = None
 
         self._reset_client = self.create_client(
             Trigger,
@@ -220,13 +251,18 @@ class InterceptionController(Node):
 
         self._arm_srv = self.create_service(
             Trigger,
-            "/interception_controller/arm",
+            "~/arm",
             self._handle_arm,
         )
         self._disarm_srv = self.create_service(
             Trigger,
-            "/interception_controller/disarm",
+            "~/disarm",
             self._handle_disarm,
+        )
+        self._set_dry_run_srv = self.create_service(
+            SetBool,
+            "~/set_dry_run",
+            self._handle_set_dry_run,
         )
 
         self._intercept_sub = self.create_subscription(
@@ -234,6 +270,12 @@ class InterceptionController(Node):
             str(self.get_parameter("intercept_pose_topic").value),
             self._handle_intercept_pose,
             10,
+        )
+        self._rollout_prediction_sub = self.create_subscription(
+            Float32MultiArray,
+            str(self.get_parameter("rollout_prediction_topic").value),
+            self._handle_rollout_prediction,
+            1,
         )
 
         self._table_pose_sub = self.create_subscription(
@@ -245,7 +287,12 @@ class InterceptionController(Node):
 
         self._status_pub = self.create_publisher(
             String,
-            "/interception_controller/status",
+            "~/status",
+            10,
+        )
+        self._selected_goto_s_pub = self.create_publisher(
+            Float64,
+            "~/selected_goto_s",
             10,
         )
         self._commanded_target_table_pub = self.create_publisher(
@@ -260,12 +307,77 @@ class InterceptionController(Node):
 
         self.get_logger().info(
             "interception_controller started: "
+            f"command_source={self._command_source}, "
             f"intercept_pose_topic={self.get_parameter('intercept_pose_topic').value}, "
+            f"rollout_prediction_topic={self.get_parameter('rollout_prediction_topic').value}, "
             f"reset_service={self.get_parameter('trajectory_reset_service').value}, "
             f"project_service={self.get_parameter('project_point_service').value}, "
             f"action={self.get_parameter('trajectory_action_name').value}, "
-            f"action_type={action_type_string}"
+            f"action_type={action_type_string}, "
+            f"dry_run={self._get_dry_run()}, "
+            f"rollout_required_consecutive={int(self.get_parameter('rollout_required_consecutive').value)}, "
+            f"rollout_execute_threshold={float(self.get_parameter('rollout_execute_threshold').value):.3f}"
         )
+
+    def _get_dry_run(self) -> bool:
+        with self._mode_lock:
+            return bool(self._dry_run)
+
+    def _set_dry_run(self, dry_run: bool) -> None:
+        with self._mode_lock:
+            self._dry_run = bool(dry_run)
+
+    def _validate_command_source(self) -> str:
+        value = str(self.get_parameter("command_source").value).strip().lower()
+        if value not in {"scene", "rollout"}:
+            raise ValueError(
+                "command_source must be one of {'scene', 'rollout'}, "
+                f"got '{self.get_parameter('command_source').value}'"
+            )
+        return value
+
+    def _validate_rollout_configuration(self, validate_bounds: bool) -> None:
+        threshold = float(self.get_parameter("rollout_execute_threshold").value)
+        _require_in_range("rollout_execute_threshold", threshold, 0.0, 1.0)
+
+        required = int(self.get_parameter("rollout_required_consecutive").value)
+        if required < 1:
+            raise ValueError(
+                f"rollout_required_consecutive must be >= 1, got {required}"
+            )
+
+        gap_sec = float(self.get_parameter("rollout_max_prediction_gap_sec").value)
+        if gap_sec <= 0.0:
+            raise ValueError(
+                f"rollout_max_prediction_gap_sec must be > 0, got {gap_sec}"
+            )
+
+        spread_m = float(self.get_parameter("rollout_max_target_spread_m").value)
+        _require_minimum("rollout_max_target_spread_m", spread_m, 0.0)
+
+        ignore_sec = float(self.get_parameter("rollout_post_arm_ignore_sec").value)
+        _require_minimum("rollout_post_arm_ignore_sec", ignore_sec, 0.0)
+
+        if validate_bounds:
+            min_target = float(self.get_parameter("rollout_min_target_s_m").value)
+            max_target = float(self.get_parameter("rollout_max_target_s_m").value)
+            if min_target >= max_target:
+                raise ValueError(
+                    "rollout_min_target_s_m must be < rollout_max_target_s_m before arming "
+                    f"rollout mode, got min={min_target} max={max_target}"
+                )
+
+    def _clear_rollout_filter(self) -> None:
+        self._rollout_predictions.clear()
+        self._rollout_last_receive_time_sec = None
+
+    def _rollout_qualifying_count(self) -> int:
+        return len(self._rollout_predictions)
+
+    def _waiting_description(self) -> str:
+        if self._command_source == "rollout":
+            return "qualifying rollout prediction"
+        return "scene intercept pose"
 
     def _warn_throttled(self, key: str, msg: str, period_sec: float = 1.0) -> None:
         now_sec = self._now_sec()
@@ -450,6 +562,7 @@ class InterceptionController(Node):
         self._accept_after_time_sec = None
         self._clear_projection_request_cache()
         self._clear_pending_publish_data()
+        self._clear_rollout_filter()
 
         if error:
             self._last_error = reason
@@ -476,11 +589,36 @@ class InterceptionController(Node):
 
         self._generation += 1
         generation = self._generation
+        self._selected_goto_s_publish_generation = None
         self._last_error = ""
         self._arm_time_sec = self._now_sec()
         self._active_goal_handle = None
         self._clear_projection_request_cache()
         self._clear_pending_publish_data()
+        self._clear_rollout_filter()
+
+        if self._command_source == "rollout":
+            try:
+                self._validate_rollout_configuration(validate_bounds=True)
+            except ValueError as exc:
+                self._freeze(str(exc), error=True)
+                response.success = False
+                response.message = self._last_error
+                return response
+
+            now_sec = self._now_sec()
+            ignore_sec = float(self.get_parameter("rollout_post_arm_ignore_sec").value)
+            dry_run = self._get_dry_run()
+            self._waiting_start_time_sec = now_sec
+            self._accept_after_time_sec = now_sec + ignore_sec
+            self._set_state(
+                InterceptionState.ARMED_WAITING,
+                f"rollout armed; accepting predictions after {ignore_sec:.3f}s",
+            )
+            response.success = True
+            mode = "dry-run" if dry_run else "live"
+            response.message = f"Interception armed in rollout {mode} mode."
+            return response
 
         require_reset = bool(self.get_parameter("require_reset_service").value)
         reset_service_name = str(self.get_parameter("trajectory_reset_service").value)
@@ -491,7 +629,7 @@ class InterceptionController(Node):
             response.message = self._last_error
             return response
 
-        if self._reset_client.service_is_ready():
+        if require_reset and self._reset_client.service_is_ready():
             self._set_state(InterceptionState.RESETTING, "calling trajectory estimator reset")
             future = self._reset_client.call_async(Trigger.Request())
             future.add_done_callback(lambda fut: self._on_reset_done(fut, generation))
@@ -546,12 +684,37 @@ class InterceptionController(Node):
         self._generation += 1
         self._clear_projection_request_cache()
         self._clear_pending_publish_data()
+        self._clear_rollout_filter()
         self._freeze("disarmed by service call", error=False)
         response.success = True
         response.message = "Interception controller disarmed/frozen."
         return response
 
+    def _handle_set_dry_run(self, request: SetBool.Request, response: SetBool.Response) -> SetBool.Response:
+        requested = bool(request.data)
+        if self._state != InterceptionState.FROZEN:
+            response.success = False
+            response.message = (
+                "Rejected: controller must be FROZEN; "
+                f"current state={self._state.value}; dry_run={self._get_dry_run()}"
+            )
+            self.get_logger().warn(
+                f"set_dry_run rejected: requested={requested} state={self._state.value}"
+            )
+            return response
+
+        self._set_dry_run(requested)
+        response.success = True
+        response.message = f"dry_run={self._get_dry_run()}"
+        self.get_logger().info(
+            f"set_dry_run accepted: requested={requested} resulting={self._get_dry_run()}"
+        )
+        return response
+
     def _handle_intercept_pose(self, msg: PoseStamped) -> None:
+        if self._command_source != "scene":
+            return
+
         if self._state != InterceptionState.ARMED_WAITING:
             return
 
@@ -602,6 +765,101 @@ class InterceptionController(Node):
 
         future = self._project_client.call_async(req)
         future.add_done_callback(lambda fut: self._on_projection_done(fut, generation))
+
+    def _handle_rollout_prediction(self, msg: Float32MultiArray) -> None:
+        if self._command_source != "rollout":
+            return
+
+        if self._state != InterceptionState.ARMED_WAITING:
+            return
+
+        now_sec = self._now_sec()
+        if self._accept_after_time_sec is not None and now_sec < self._accept_after_time_sec:
+            self._debug("ignoring rollout prediction during post-arm ignore window")
+            return
+
+        if len(msg.data) != 2:
+            self.get_logger().warn("ignoring rollout prediction with len(data) != 2")
+            self._clear_rollout_filter()
+            return
+
+        try:
+            target_s_m = float(msg.data[0])
+            execute_probability = float(msg.data[1])
+        except (TypeError, ValueError):
+            self.get_logger().warn("ignoring rollout prediction with non-numeric values")
+            self._clear_rollout_filter()
+            return
+
+        if not _all_finite((target_s_m, execute_probability)):
+            self.get_logger().warn("ignoring non-finite rollout prediction")
+            self._clear_rollout_filter()
+            return
+
+        if execute_probability < 0.0 or execute_probability > 1.0:
+            self.get_logger().warn(
+                "ignoring rollout prediction with probability outside [0, 1]"
+            )
+            self._clear_rollout_filter()
+            return
+
+        min_target = float(self.get_parameter("rollout_min_target_s_m").value)
+        max_target = float(self.get_parameter("rollout_max_target_s_m").value)
+        if target_s_m < min_target or target_s_m > max_target:
+            self.get_logger().warn(
+                "ignoring rollout prediction outside configured target_s bounds"
+            )
+            self._clear_rollout_filter()
+            return
+
+        max_gap_sec = float(self.get_parameter("rollout_max_prediction_gap_sec").value)
+        if (
+            self._rollout_last_receive_time_sec is not None
+            and (now_sec - self._rollout_last_receive_time_sec) > max_gap_sec
+        ):
+            self._clear_rollout_filter()
+
+        self._rollout_last_receive_time_sec = now_sec
+
+        threshold = float(self.get_parameter("rollout_execute_threshold").value)
+        if execute_probability < threshold:
+            self._clear_rollout_filter()
+            return
+
+        self._rollout_predictions.append((target_s_m, execute_probability))
+
+        required = int(self.get_parameter("rollout_required_consecutive").value)
+        if len(self._rollout_predictions) < required:
+            return
+
+        recent = list(self._rollout_predictions)[-required:]
+        targets = [target for target, _probability in recent]
+        probabilities = [probability for _target, probability in recent]
+        target_spread_m = max(targets) - min(targets)
+
+        while len(self._rollout_predictions) > required:
+            self._rollout_predictions.popleft()
+
+        max_spread_m = float(self.get_parameter("rollout_max_target_spread_m").value)
+        if target_spread_m > max_spread_m and not math.isclose(
+            target_spread_m,
+            max_spread_m,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            return
+
+        final_target_s = float(statistics.median(targets))
+        self.get_logger().info(
+            "stable rollout prediction accepted: "
+            f"threshold={threshold:.3f}, "
+            f"probabilities={probabilities}, "
+            f"count={required}, "
+            f"target_s={final_target_s:.6f}, "
+            f"spread={target_spread_m:.6f}"
+        )
+        self._clear_rollout_filter()
+        self._send_goto_s_goal(final_target_s, self._generation)
 
     def _on_projection_done(self, future: Any, generation: int) -> None:
         if generation != self._generation:
@@ -675,9 +933,30 @@ class InterceptionController(Node):
         if hasattr(goal, field):
             setattr(goal, field, value)
 
+    def _publish_selected_goto_s_once(self, s: float, generation: int) -> None:
+        if generation != self._generation:
+            return
+        if self._selected_goto_s_publish_generation == generation:
+            return
+
+        msg = Float64()
+        msg.data = float(s)
+        self._selected_goto_s_pub.publish(msg)
+        self._selected_goto_s_publish_generation = generation
+
     def _send_goto_s_goal(self, s: float, generation: int) -> None:
         if generation != self._generation:
             self._clear_pending_publish_data(generation)
+            return
+
+        self._publish_selected_goto_s_once(s, generation)
+
+        if self._get_dry_run():
+            source_label = self._command_source.upper()
+            self._freeze(
+                f"{source_label}_DRY_RUN selected target_s={float(s):.6f}",
+                error=False,
+            )
             return
 
         if not self._action_client.wait_for_server(timeout_sec=0.2):
@@ -826,7 +1105,7 @@ class InterceptionController(Node):
         elapsed = self._now_sec() - self._waiting_start_time_sec
         if elapsed > max_wait:
             self._freeze(
-                f"timed out waiting for intercept pose after {elapsed:.3f}s",
+                f"timed out waiting for {self._waiting_description()} after {elapsed:.3f}s",
                 error=True,
             )
 
@@ -835,6 +1114,11 @@ class InterceptionController(Node):
         msg.data = (
             f"state={self._state.value}; "
             f"generation={self._generation}; "
+            f"command_source={self._command_source}; "
+            f"dry_run={self._get_dry_run()}; "
+            f"rollout_count={self._rollout_qualifying_count()}; "
+            f"rollout_required_consecutive={int(self.get_parameter('rollout_required_consecutive').value)}; "
+            f"rollout_execute_threshold={float(self.get_parameter('rollout_execute_threshold').value):.3f}; "
             f"info={self._last_info}; "
             f"last_error={self._last_error}"
         )
