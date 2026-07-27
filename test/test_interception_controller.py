@@ -535,6 +535,30 @@ def test_scene_live_mode_publishes_selected_s_and_sends_action(controller_module
     assert len(controller._action_client.goals) == 1
 
 
+def test_cont_tracker_backend_publishes_updates_after_goal_acceptance(controller_module, controller):
+    backend_module = importlib.import_module("ball_interception_controller.execution_backends")
+    backend = backend_module.ContTrackerBackend(
+        controller,
+        action_name="/cont_tracker",
+        action_type=FakeAction,
+        target_topic="/cont_tracker/target_s",
+        callbacks=controller,
+    )
+
+    goal = FakeAction.Goal()
+    request = backend_module.GoalRequest(goal=goal, target_s=0.25, generation=controller._generation)
+    backend.start(request)
+
+    assert len(backend.action_client.goals) == 1
+
+    backend._on_goal_response(FakeFuture(FakeGoalHandle()), controller._generation)
+    backend.update_target(0.31, controller._generation)
+    backend.update_target(0.31, controller._generation)
+
+    assert len(backend.target_publisher.messages) == 1
+    assert backend.target_publisher.messages[0].data == pytest.approx(0.31)
+
+
 def test_invalid_rollout_predictions_do_not_publish_selected_s(controller_module, controller):
     prepare_rollout(controller, controller_module, dry_run=True)
 

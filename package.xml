@@ -3,11 +3,12 @@
 <package format="3">
   <name>ball_interception_controller</name>
   <version>0.0.0</version>
-  <description>One-shot ball interception coordinator using scene intercept pose and trajectory executor.</description>
+  <description>Ball interception coordinator with selectable goto_s and continuous-tracking execution backends.</description>
   <maintainer email="jau.gretler@gmail.com">jau</maintainer>
   <license>Apache 2.0</license>
 
   <depend>rclpy</depend>
+  <depend>action_msgs</depend>
   <depend>std_msgs</depend>
   <depend>std_srvs</depend>
   <depend>geometry_msgs</depend>

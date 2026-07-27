@@ -13,6 +13,9 @@ def generate_launch_description() -> LaunchDescription:
     project_point_service = LaunchConfiguration("project_point_service")
     trajectory_action_name = LaunchConfiguration("trajectory_action_name")
     trajectory_action_type = LaunchConfiguration("trajectory_action_type")
+    execution_backend = LaunchConfiguration("execution_backend")
+    cont_tracker_action_name = LaunchConfiguration("cont_tracker_action_name")
+    cont_tracker_target_topic = LaunchConfiguration("cont_tracker_target_topic")
     cmd_goto_s_constant_name = LaunchConfiguration("cmd_goto_s_constant_name")
     cmd_goto_s_fallback_value = LaunchConfiguration("cmd_goto_s_fallback_value")
     ee_name = LaunchConfiguration("ee_name")
@@ -53,6 +56,9 @@ def generate_launch_description() -> LaunchDescription:
                 "project_point_service": project_point_service,
                 "trajectory_action_name": trajectory_action_name,
                 "trajectory_action_type": trajectory_action_type,
+                "execution_backend": execution_backend,
+                "cont_tracker_action_name": cont_tracker_action_name,
+                "cont_tracker_target_topic": cont_tracker_target_topic,
                 "cmd_goto_s_constant_name": cmd_goto_s_constant_name,
                 "cmd_goto_s_fallback_value": cmd_goto_s_fallback_value,
                 "ee_name": ee_name,
@@ -123,6 +129,21 @@ def generate_launch_description() -> LaunchDescription:
                 "trajectory_action_type",
                 default_value="fr3_husky_msgs.action.LineTrajectory",
                 description="Python action type path for the trajectory action.",
+            ),
+            DeclareLaunchArgument(
+                "execution_backend",
+                default_value="goto_s",
+                description="Execution backend: goto_s or cont_tracker.",
+            ),
+            DeclareLaunchArgument(
+                "cont_tracker_action_name",
+                default_value="/cont_tracker",
+                description="Continuous-tracking action server name.",
+            ),
+            DeclareLaunchArgument(
+                "cont_tracker_target_topic",
+                default_value="/cont_tracker/target_s",
+                description="Continuous-tracking target_s topic.",
             ),
             DeclareLaunchArgument(
                 "cmd_goto_s_constant_name",

@@ -26,6 +26,7 @@ setup(
     entry_points={
         'console_scripts': [
             'interception_controller = ball_interception_controller.interception_controller:main',
+            'cont_tracker_test_client = ball_interception_controller.cont_tracker_test_client:main',
         ],
     },
 )

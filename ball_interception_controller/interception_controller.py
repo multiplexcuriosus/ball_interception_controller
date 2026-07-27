@@ -13,12 +13,18 @@ from typing import Any, Deque, Dict, Optional, Tuple, Type
 import rclpy
 from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import PointStamped, PoseStamped
-from rclpy.action import ActionClient
 from rclpy.node import Node
 from std_msgs.msg import Float32MultiArray, Float64, String
 from std_srvs.srv import SetBool, Trigger
 
 from fr3_husky_msgs.srv import ProjectPointToLine
+
+from ball_interception_controller.execution_backends import (
+    ContTrackerBackend,
+    ExecutionBackend,
+    GoalRequest,
+    GotoSBackend,
+)
 
 
 class InterceptionState(str, Enum):
@@ -137,6 +143,15 @@ class InterceptionController(Node):
             "trajectory_action_name",
             "/trajectory_executor",
         )
+        self.declare_parameter("execution_backend", "cont_tracker")
+        self.declare_parameter(
+            "cont_tracker_action_name",
+            "/cont_tracker",
+        )
+        self.declare_parameter(
+            "cont_tracker_target_topic",
+            "/cont_tracker/target_s",
+        )
 
         # This may need adjustment to your actual .action type name.
         self.declare_parameter(
@@ -235,6 +250,30 @@ class InterceptionController(Node):
         self._pending_publish_table_target_xyz: Optional[Tuple[float, float, float]] = None
         self._selected_goto_s_publish_generation: Optional[int] = None
 
+        backend_name = str(self.get_parameter("execution_backend").value).strip().lower()
+        if backend_name == "goto_s":
+            self._execution_backend: ExecutionBackend = GotoSBackend(
+                self,
+                action_name=str(self.get_parameter("trajectory_action_name").value),
+                action_type=self._action_type,
+                callbacks=self,
+            )
+        elif backend_name == "cont_tracker":
+            self._execution_backend = ContTrackerBackend(
+                self,
+                action_name=str(self.get_parameter("cont_tracker_action_name").value),
+                action_type=self._action_type,
+                target_topic=str(self.get_parameter("cont_tracker_target_topic").value),
+                callbacks=self,
+            )
+        else:
+            raise ValueError(
+                "execution_backend must be one of {'goto_s', 'cont_tracker'}, "
+                f"got '{self.get_parameter('execution_backend').value}'"
+            )
+
+        self._action_client = self._execution_backend.action_client
+
         self._reset_client = self.create_client(
             Trigger,
             str(self.get_parameter("trajectory_reset_service").value),
@@ -242,11 +281,6 @@ class InterceptionController(Node):
         self._project_client = self.create_client(
             ProjectPointToLine,
             str(self.get_parameter("project_point_service").value),
-        )
-        self._action_client = ActionClient(
-            self,
-            self._action_type,
-            str(self.get_parameter("trajectory_action_name").value),
         )
 
         self._arm_srv = self.create_service(
@@ -313,6 +347,7 @@ class InterceptionController(Node):
             f"reset_service={self.get_parameter('trajectory_reset_service').value}, "
             f"project_service={self.get_parameter('project_point_service').value}, "
             f"action={self.get_parameter('trajectory_action_name').value}, "
+            f"execution_backend={self.get_parameter('execution_backend').value}, "
             f"action_type={action_type_string}, "
             f"dry_run={self._get_dry_run()}, "
             f"rollout_required_consecutive={int(self.get_parameter('rollout_required_consecutive').value)}, "
@@ -563,6 +598,7 @@ class InterceptionController(Node):
         self._clear_projection_request_cache()
         self._clear_pending_publish_data()
         self._clear_rollout_filter()
+        self._execution_backend.shutdown()
 
         if error:
             self._last_error = reason
@@ -676,12 +712,14 @@ class InterceptionController(Node):
     def _handle_disarm(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
         del request
 
-        if self._state == InterceptionState.EXECUTING:
+        if self._state == InterceptionState.EXECUTING and self._execution_backend.backend_name != "cont_tracker":
             response.success = False
             response.message = "Already executing; not canceling automatically. Use trajectory executor cancel if needed."
             return response
 
         self._generation += 1
+        if self._execution_backend.is_active():
+            self._execution_backend.cancel("disarmed by service call", self._generation)
         self._clear_projection_request_cache()
         self._clear_pending_publish_data()
         self._clear_rollout_filter()
@@ -716,6 +754,10 @@ class InterceptionController(Node):
             return
 
         if self._state != InterceptionState.ARMED_WAITING:
+            if self._execution_backend.backend_name != "cont_tracker" or not self._execution_backend.is_active():
+                return
+
+        if self._state not in {InterceptionState.ARMED_WAITING, InterceptionState.EXECUTING}:
             return
 
         now_sec = self._now_sec()
@@ -771,6 +813,10 @@ class InterceptionController(Node):
             return
 
         if self._state != InterceptionState.ARMED_WAITING:
+            if self._execution_backend.backend_name != "cont_tracker" or not self._execution_backend.is_active():
+                return
+
+        if self._state not in {InterceptionState.ARMED_WAITING, InterceptionState.EXECUTING}:
             return
 
         now_sec = self._now_sec()
@@ -897,6 +943,12 @@ class InterceptionController(Node):
             self._send_goto_s_goal(float(result.s), generation)
             return
 
+        if self._execution_backend.backend_name == "cont_tracker" and self._execution_backend.is_active():
+            self._execution_backend.update_target(float(result.s), generation)
+            self._clear_pending_publish_data(generation)
+            self._set_state(InterceptionState.EXECUTING, f"cont_tracker update target_s={float(result.s):.6f}")
+            return
+
         table_target_xyz = self._base_to_table_target(base_target_xyz)
         self._pending_publish_generation = generation
         self._pending_publish_target_s = float(result.s)
@@ -951,6 +1003,14 @@ class InterceptionController(Node):
 
         self._publish_selected_goto_s_once(s, generation)
 
+        if self._execution_backend.backend_name == "cont_tracker" and self._execution_backend.is_active():
+            self._execution_backend.update_target(float(s), generation)
+            self._set_state(
+                InterceptionState.EXECUTING,
+                f"updating cont_tracker target_s={float(s):.6f}",
+            )
+            return
+
         if self._get_dry_run():
             source_label = self._command_source.upper()
             self._freeze(
@@ -1002,23 +1062,12 @@ class InterceptionController(Node):
 
         self._active_command_v_max = v_max
         self._active_command_a_max = a_max
-        future = self._action_client.send_goal_async(goal)
-        future.add_done_callback(lambda fut: self._on_goal_response(fut, generation))
+        self._execution_backend.start(GoalRequest(goal=goal, target_s=float(s), generation=generation))
 
-    def _on_goal_response(self, future: Any, generation: int) -> None:
+    def on_backend_goal_accepted(self, backend_name: str, generation: int, goal_handle: Any) -> None:
+        del backend_name
         if generation != self._generation:
             self._clear_pending_publish_data(generation)
-            return
-
-        try:
-            goal_handle = future.result()
-        except Exception as exc:
-            self._freeze(f"failed to send action goal: {exc}", error=True)
-            return
-
-        if goal_handle is None or not goal_handle.accepted:
-            self._clear_pending_publish_data(generation)
-            self._freeze("trajectory executor rejected CMD_GOTO_S goal", error=True)
             return
 
         if (
@@ -1051,22 +1100,16 @@ class InterceptionController(Node):
         self._active_goal_handle = goal_handle
         self._set_state(InterceptionState.EXECUTING, "trajectory executor accepted goal")
 
-        result_future = goal_handle.get_result_async()
-        result_future.add_done_callback(lambda fut: self._on_action_result(fut, generation))
+    def on_backend_goal_rejected(self, backend_name: str, generation: int, reason: str) -> None:
+        del backend_name, generation
+        self._clear_pending_publish_data()
+        self._freeze(reason, error=True)
 
-    def _on_action_result(self, future: Any, generation: int) -> None:
+    def on_backend_result(self, backend_name: str, generation: int, status: Any, result: Any) -> None:
+        del backend_name
         if generation != self._generation:
             self._clear_pending_publish_data(generation)
             return
-
-        try:
-            wrapped = future.result()
-        except Exception as exc:
-            self._freeze(f"trajectory action result failed: {exc}", error=True)
-            return
-
-        status = getattr(wrapped, "status", None)
-        result = getattr(wrapped, "result", None)
 
         limits_suffix = ""
         if (
@@ -1090,6 +1133,19 @@ class InterceptionController(Node):
         if result is not None and hasattr(result, "message"):
             msg += f": {result.message}"
         self._freeze(msg + limits_suffix, error=True)
+
+    def on_backend_cancel_complete(self, backend_name: str, generation: int, result: Any) -> None:
+        del backend_name, result
+        if generation != self._generation:
+            return
+        self._freeze("interception motion canceled", error=False)
+
+    def on_backend_feedback(self, backend_name: str, generation: int, feedback: Any) -> None:
+        del backend_name, generation, feedback
+
+    def on_backend_error(self, backend_name: str, generation: int, error: Exception) -> None:
+        del backend_name, generation
+        self._freeze(f"backend error: {error}", error=True)
 
     def _check_wait_timeout(self) -> None:
         if self._state != InterceptionState.ARMED_WAITING:
@@ -1115,6 +1171,7 @@ class InterceptionController(Node):
             f"state={self._state.value}; "
             f"generation={self._generation}; "
             f"command_source={self._command_source}; "
+            f"execution_backend={self._execution_backend.backend_name}; "
             f"dry_run={self._get_dry_run()}; "
             f"rollout_count={self._rollout_qualifying_count()}; "
             f"rollout_required_consecutive={int(self.get_parameter('rollout_required_consecutive').value)}; "
