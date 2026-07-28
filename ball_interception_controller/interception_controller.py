@@ -2,19 +2,18 @@
 
 from __future__ import annotations
 
-from collections import deque
 import importlib
 import math
-import statistics
+import re
 import threading
 from enum import Enum
-from typing import Any, Deque, Dict, Optional, Tuple, Type
+from typing import Any, Dict, Optional, Tuple, Type
 
 import rclpy
 from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import PointStamped, PoseStamped
 from rclpy.node import Node
-from std_msgs.msg import Float32MultiArray, Float64, String
+from std_msgs.msg import Float64, String
 from std_srvs.srv import SetBool, Trigger
 
 from fr3_husky_msgs.srv import ProjectPointToLine
@@ -30,6 +29,7 @@ from ball_interception_controller.execution_backends import (
 class InterceptionState(str, Enum):
     FROZEN = "FROZEN"
     RESETTING = "RESETTING"
+    ROLLOUT_RESET_PENDING = "ROLLOUT_RESET_PENDING"
     ARMED_WAITING = "ARMED_WAITING"
     PROJECTING = "PROJECTING"
     SENDING_ACTION = "SENDING_ACTION"
@@ -194,14 +194,15 @@ class InterceptionController(Node):
         self.declare_parameter("require_reset_service", True)
         self.declare_parameter("status_publish_rate_hz", 2.0)
         self.declare_parameter("debug_log", False)
-        self.declare_parameter("rollout_prediction_topic", "/act/intercept_prediction")
-        self.declare_parameter("rollout_execute_threshold", 0.90)
-        self.declare_parameter("rollout_required_consecutive", 3)
-        self.declare_parameter("rollout_max_prediction_gap_sec", 0.25)
-        self.declare_parameter("rollout_max_target_spread_m", 0.02)
-        self.declare_parameter("rollout_post_arm_ignore_sec", 0.25)
+        self.declare_parameter("rollout_prediction_topic", "/act/intercept_prediction_current_abs_s")
+        self.declare_parameter("current_tcp_s_topic", "/middle_line/current_tcp_s")
+        self.declare_parameter("max_current_tcp_s_age_sec", 0.15)
+        self.declare_parameter("rollout_prediction_timeout_sec", 0.25)
         self.declare_parameter("rollout_min_target_s_m", -0.15)
         self.declare_parameter("rollout_max_target_s_m", 0.15)
+        self.declare_parameter("rollout_reset_service", "/act/reset_temporal_aggregation")
+        self.declare_parameter("rollout_reset_timeout_sec", 0.75)
+        self.declare_parameter("rollout_post_reset_guard_sec", 0.05)
         self.declare_parameter("dry_run", True)
 
         action_type_string = str(self.get_parameter("trajectory_action_type").value)
@@ -229,8 +230,17 @@ class InterceptionController(Node):
         self._active_command_v_max: Optional[float] = None
         self._active_command_a_max: Optional[float] = None
         self._warn_throttle_last_sec: Dict[str, float] = {}
-        self._rollout_predictions: Deque[Tuple[float, float]] = deque()
-        self._rollout_last_receive_time_sec: Optional[float] = None
+        self._rollout_last_valid_receive_time_sec: Optional[float] = None
+        self._latest_rollout_target_s: Optional[float] = None
+        self._latest_current_tcp_s: Optional[float] = None
+        self._latest_current_tcp_s_receive_time_sec: Optional[float] = None
+        self._rollout_reset_pending = False
+        self._rollout_predictions_accepted = False
+        self._rollout_reset_request_generation: Optional[int] = None
+        self._rollout_reset_request_start_sec: Optional[float] = None
+        self._rollout_reset_ack_time_sec: Optional[float] = None
+        self._rollout_last_ack_epoch: Optional[int] = None
+        self._rollout_post_reset_guard_until_sec: Optional[float] = None
 
         self._latest_table_t_base_table: Optional[Tuple[float, float, float]] = None
         self._latest_table_r_base_table: Optional[
@@ -248,8 +258,6 @@ class InterceptionController(Node):
         self._pending_publish_cross_track_error_m: Optional[float] = None
         self._pending_publish_base_target_xyz: Optional[Tuple[float, float, float]] = None
         self._pending_publish_table_target_xyz: Optional[Tuple[float, float, float]] = None
-        self._selected_goto_s_publish_generation: Optional[int] = None
-
         backend_name = str(self.get_parameter("execution_backend").value).strip().lower()
         if backend_name == "goto_s":
             self._execution_backend: ExecutionBackend = GotoSBackend(
@@ -282,6 +290,10 @@ class InterceptionController(Node):
             ProjectPointToLine,
             str(self.get_parameter("project_point_service").value),
         )
+        self._rollout_reset_client = self.create_client(
+            Trigger,
+            str(self.get_parameter("rollout_reset_service").value),
+        )
 
         self._arm_srv = self.create_service(
             Trigger,
@@ -306,10 +318,16 @@ class InterceptionController(Node):
             10,
         )
         self._rollout_prediction_sub = self.create_subscription(
-            Float32MultiArray,
+            Float64,
             str(self.get_parameter("rollout_prediction_topic").value),
             self._handle_rollout_prediction,
             1,
+        )
+        self._current_tcp_s_sub = self.create_subscription(
+            Float64,
+            str(self.get_parameter("current_tcp_s_topic").value),
+            self._handle_current_tcp_s,
+            10,
         )
 
         self._table_pose_sub = self.create_subscription(
@@ -350,8 +368,10 @@ class InterceptionController(Node):
             f"execution_backend={self.get_parameter('execution_backend').value}, "
             f"action_type={action_type_string}, "
             f"dry_run={self._get_dry_run()}, "
-            f"rollout_required_consecutive={int(self.get_parameter('rollout_required_consecutive').value)}, "
-            f"rollout_execute_threshold={float(self.get_parameter('rollout_execute_threshold').value):.3f}"
+            f"current_tcp_s_topic={self.get_parameter('current_tcp_s_topic').value}, "
+            f"rollout_reset_service={self.get_parameter('rollout_reset_service').value}, "
+            f"rollout_prediction_timeout_sec={float(self.get_parameter('rollout_prediction_timeout_sec').value):.3f}, "
+            "rollout_s_positive_direction=+X_in_robot_base"
         )
 
     def _get_dry_run(self) -> bool:
@@ -372,26 +392,23 @@ class InterceptionController(Node):
         return value
 
     def _validate_rollout_configuration(self, validate_bounds: bool) -> None:
-        threshold = float(self.get_parameter("rollout_execute_threshold").value)
-        _require_in_range("rollout_execute_threshold", threshold, 0.0, 1.0)
-
-        required = int(self.get_parameter("rollout_required_consecutive").value)
-        if required < 1:
+        timeout_sec = float(self.get_parameter("rollout_prediction_timeout_sec").value)
+        if timeout_sec <= 0.0:
             raise ValueError(
-                f"rollout_required_consecutive must be >= 1, got {required}"
+                f"rollout_prediction_timeout_sec must be > 0, got {timeout_sec}"
             )
 
-        gap_sec = float(self.get_parameter("rollout_max_prediction_gap_sec").value)
-        if gap_sec <= 0.0:
+        max_current_tcp_s_age_sec = float(self.get_parameter("max_current_tcp_s_age_sec").value)
+        _require_minimum("max_current_tcp_s_age_sec", max_current_tcp_s_age_sec, 0.0)
+
+        reset_timeout_sec = float(self.get_parameter("rollout_reset_timeout_sec").value)
+        if reset_timeout_sec <= 0.0:
             raise ValueError(
-                f"rollout_max_prediction_gap_sec must be > 0, got {gap_sec}"
+                f"rollout_reset_timeout_sec must be > 0, got {reset_timeout_sec}"
             )
 
-        spread_m = float(self.get_parameter("rollout_max_target_spread_m").value)
-        _require_minimum("rollout_max_target_spread_m", spread_m, 0.0)
-
-        ignore_sec = float(self.get_parameter("rollout_post_arm_ignore_sec").value)
-        _require_minimum("rollout_post_arm_ignore_sec", ignore_sec, 0.0)
+        reset_guard_sec = float(self.get_parameter("rollout_post_reset_guard_sec").value)
+        _require_minimum("rollout_post_reset_guard_sec", reset_guard_sec, 0.0)
 
         if validate_bounds:
             min_target = float(self.get_parameter("rollout_min_target_s_m").value)
@@ -402,17 +419,44 @@ class InterceptionController(Node):
                     f"rollout mode, got min={min_target} max={max_target}"
                 )
 
-    def _clear_rollout_filter(self) -> None:
-        self._rollout_predictions.clear()
-        self._rollout_last_receive_time_sec = None
+    def _clear_rollout_receive_state(self) -> None:
+        self._rollout_last_valid_receive_time_sec = None
+        self._latest_rollout_target_s = None
 
-    def _rollout_qualifying_count(self) -> int:
-        return len(self._rollout_predictions)
+    def _disable_rollout_prediction_acceptance(self) -> None:
+        self._rollout_predictions_accepted = False
+        self._rollout_post_reset_guard_until_sec = None
+        self._clear_rollout_receive_state()
+
+    def _parse_rollout_epoch(self, message: str) -> Optional[int]:
+        m = re.search(r"rollout_epoch=(\d+)", str(message))
+        if m is None:
+            return None
+        try:
+            return int(m.group(1))
+        except (TypeError, ValueError):
+            return None
 
     def _waiting_description(self) -> str:
         if self._command_source == "rollout":
-            return "qualifying rollout prediction"
+            return "valid rollout prediction"
         return "scene intercept pose"
+
+    def _publish_selected_goto_s(self, s: float, generation: int) -> None:
+        if generation != self._generation:
+            return
+        msg = Float64()
+        msg.data = float(s)
+        self._selected_goto_s_pub.publish(msg)
+
+    def _latest_current_tcp_s_if_fresh(self) -> Optional[float]:
+        if self._latest_current_tcp_s is None or self._latest_current_tcp_s_receive_time_sec is None:
+            return None
+        age_sec = self._now_sec() - self._latest_current_tcp_s_receive_time_sec
+        max_age_sec = float(self.get_parameter("max_current_tcp_s_age_sec").value)
+        if age_sec > max_age_sec:
+            return None
+        return float(self._latest_current_tcp_s)
 
     def _warn_throttled(self, key: str, msg: str, period_sec: float = 1.0) -> None:
         now_sec = self._now_sec()
@@ -595,9 +639,12 @@ class InterceptionController(Node):
         self._active_goal_handle = None
         self._waiting_start_time_sec = None
         self._accept_after_time_sec = None
+        self._rollout_reset_pending = False
+        self._rollout_reset_request_generation = None
+        self._rollout_reset_request_start_sec = None
         self._clear_projection_request_cache()
         self._clear_pending_publish_data()
-        self._clear_rollout_filter()
+        self._disable_rollout_prediction_acceptance()
         self._execution_backend.shutdown()
 
         if error:
@@ -615,6 +662,7 @@ class InterceptionController(Node):
 
         if self._state in {
             InterceptionState.RESETTING,
+            InterceptionState.ROLLOUT_RESET_PENDING,
             InterceptionState.PROJECTING,
             InterceptionState.SENDING_ACTION,
             InterceptionState.EXECUTING,
@@ -625,13 +673,14 @@ class InterceptionController(Node):
 
         self._generation += 1
         generation = self._generation
-        self._selected_goto_s_publish_generation = None
         self._last_error = ""
         self._arm_time_sec = self._now_sec()
         self._active_goal_handle = None
         self._clear_projection_request_cache()
         self._clear_pending_publish_data()
-        self._clear_rollout_filter()
+        self._disable_rollout_prediction_acceptance()
+        self._rollout_reset_ack_time_sec = None
+        self._rollout_last_ack_epoch = None
 
         if self._command_source == "rollout":
             try:
@@ -642,18 +691,40 @@ class InterceptionController(Node):
                 response.message = self._last_error
                 return response
 
-            now_sec = self._now_sec()
-            ignore_sec = float(self.get_parameter("rollout_post_arm_ignore_sec").value)
+            if self._execution_backend.backend_name != "cont_tracker":
+                self._freeze("rollout mode requires execution_backend=cont_tracker", error=True)
+                response.success = False
+                response.message = self._last_error
+                return response
+
+            reset_service_name = str(self.get_parameter("rollout_reset_service").value)
+            if not self._rollout_reset_client.wait_for_service(timeout_sec=0.2):
+                self._freeze(f"rollout reset service unavailable: {reset_service_name}", error=True)
+                response.success = False
+                response.message = self._last_error
+                return response
+
+            self._rollout_reset_pending = True
+            self._rollout_reset_request_generation = generation
+            self._rollout_reset_request_start_sec = self._now_sec()
+            self._set_state(InterceptionState.ROLLOUT_RESET_PENDING, "rollout reset requested; awaiting acknowledgement")
+
             dry_run = self._get_dry_run()
-            self._waiting_start_time_sec = now_sec
-            self._accept_after_time_sec = now_sec + ignore_sec
-            self._set_state(
-                InterceptionState.ARMED_WAITING,
-                f"rollout armed; accepting predictions after {ignore_sec:.3f}s",
-            )
-            response.success = True
+            try:
+                future = self._rollout_reset_client.call_async(Trigger.Request())
+            except Exception as exc:
+                self._freeze(f"rollout reset request failed: {exc}", error=True)
+                response.success = False
+                response.message = self._last_error
+                return response
+
+            future.add_done_callback(lambda fut: self._on_rollout_reset_done(fut, generation, dry_run))
             mode = "dry-run" if dry_run else "live"
-            response.message = f"Interception armed in rollout {mode} mode."
+            response.success = True
+            response.message = (
+                f"Interception arm requested in rollout {mode} mode; "
+                "waiting for temporal-aggregation reset acknowledgement."
+            )
             return response
 
         require_reset = bool(self.get_parameter("require_reset_service").value)
@@ -666,7 +737,10 @@ class InterceptionController(Node):
             return response
 
         if require_reset and self._reset_client.service_is_ready():
-            self._set_state(InterceptionState.RESETTING, "calling trajectory estimator reset")
+            self._set_state(
+                InterceptionState.RESETTING,
+                "calling trajectory estimator reset",
+            )
             future = self._reset_client.call_async(Trigger.Request())
             future.add_done_callback(lambda fut: self._on_reset_done(fut, generation))
             response.success = True
@@ -709,6 +783,71 @@ class InterceptionController(Node):
             f"{reason}; accepting intercept poses after {post_reset_ignore_sec:.3f}s",
         )
 
+    def _on_rollout_reset_done(self, future: Any, generation: int, dry_run: bool) -> None:
+        if generation != self._generation:
+            return
+        if not self._rollout_reset_pending:
+            return
+        if self._rollout_reset_request_generation != generation:
+            return
+
+        self._rollout_reset_pending = False
+        self._rollout_reset_request_start_sec = None
+
+        try:
+            result = future.result()
+        except Exception as exc:
+            self._freeze(f"rollout reset service call failed: {exc}", error=True)
+            return
+
+        if result is None or not bool(getattr(result, "success", False)):
+            msg = "rollout reset rejected"
+            if result is not None and hasattr(result, "message"):
+                msg = f"rollout reset rejected: {result.message}"
+            self._freeze(msg, error=True)
+            return
+
+        ack_time_sec = self._now_sec()
+        self._rollout_reset_ack_time_sec = ack_time_sec
+        self._rollout_last_ack_epoch = self._parse_rollout_epoch(getattr(result, "message", ""))
+        self._rollout_predictions_accepted = True
+        guard_sec = float(self.get_parameter("rollout_post_reset_guard_sec").value)
+        self._rollout_post_reset_guard_until_sec = ack_time_sec + guard_sec
+        self._arm_time_sec = ack_time_sec
+        self._waiting_start_time_sec = ack_time_sec
+        self._rollout_last_valid_receive_time_sec = None
+        self._latest_rollout_target_s = None
+        self._accept_after_time_sec = None
+
+        if dry_run:
+            self._set_state(
+                InterceptionState.ARMED_WAITING,
+                "rollout reset acknowledged; awaiting post-reset predictions",
+            )
+            return
+
+        current_tcp_s = self._latest_current_tcp_s_if_fresh()
+        if current_tcp_s is None:
+            self._freeze(
+                "rollout live arming requires a fresh finite /middle_line/current_tcp_s sample after reset acknowledgement",
+                error=True,
+            )
+            return
+
+        min_target = float(self.get_parameter("rollout_min_target_s_m").value)
+        max_target = float(self.get_parameter("rollout_max_target_s_m").value)
+        if current_tcp_s < min_target or current_tcp_s > max_target:
+            self._freeze(
+                "rollout live arming current_tcp_s outside configured bounds after reset acknowledgement: "
+                f"s={current_tcp_s:.6f} min={min_target:.6f} max={max_target:.6f}",
+                error=True,
+            )
+            return
+
+        self._publish_selected_goto_s(current_tcp_s, generation)
+        self._latest_rollout_target_s = float(current_tcp_s)
+        self._send_goto_s_goal(float(current_tcp_s), generation)
+
     def _handle_disarm(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
         del request
 
@@ -717,12 +856,16 @@ class InterceptionController(Node):
             response.message = "Already executing; not canceling automatically. Use trajectory executor cancel if needed."
             return response
 
-        self._generation += 1
+        generation = self._generation
         if self._execution_backend.is_active():
-            self._execution_backend.cancel("disarmed by service call", self._generation)
+            self._execution_backend.cancel("disarmed by service call", generation)
+        self._rollout_reset_pending = False
+        self._rollout_reset_request_generation = None
+        self._rollout_reset_request_start_sec = None
+        self._generation += 1
         self._clear_projection_request_cache()
         self._clear_pending_publish_data()
-        self._clear_rollout_filter()
+        self._disable_rollout_prediction_acceptance()
         self._freeze("disarmed by service call", error=False)
         response.success = True
         response.message = "Interception controller disarmed/frozen."
@@ -808,104 +951,67 @@ class InterceptionController(Node):
         future = self._project_client.call_async(req)
         future.add_done_callback(lambda fut: self._on_projection_done(fut, generation))
 
-    def _handle_rollout_prediction(self, msg: Float32MultiArray) -> None:
+    def _handle_current_tcp_s(self, msg: Float64) -> None:
+        value = float(msg.data)
+        if not math.isfinite(value):
+            self._warn_throttled(
+                "current_tcp_s_non_finite",
+                "ignoring non-finite /middle_line/current_tcp_s",
+                period_sec=1.0,
+            )
+            return
+        self._latest_current_tcp_s = value
+        self._latest_current_tcp_s_receive_time_sec = self._now_sec()
+
+    def _handle_rollout_prediction(self, msg: Float64) -> None:
         if self._command_source != "rollout":
             return
 
-        if self._state != InterceptionState.ARMED_WAITING:
-            if self._execution_backend.backend_name != "cont_tracker" or not self._execution_backend.is_active():
-                return
-
-        if self._state not in {InterceptionState.ARMED_WAITING, InterceptionState.EXECUTING}:
+        if self._rollout_reset_pending or not self._rollout_predictions_accepted:
             return
 
         now_sec = self._now_sec()
-        if self._accept_after_time_sec is not None and now_sec < self._accept_after_time_sec:
-            self._debug("ignoring rollout prediction during post-arm ignore window")
+        if self._rollout_post_reset_guard_until_sec is not None and now_sec < self._rollout_post_reset_guard_until_sec:
             return
 
-        if len(msg.data) != 2:
-            self.get_logger().warn("ignoring rollout prediction with len(data) != 2")
-            self._clear_rollout_filter()
+        if self._state not in {
+            InterceptionState.ARMED_WAITING,
+            InterceptionState.SENDING_ACTION,
+            InterceptionState.EXECUTING,
+        }:
             return
 
-        try:
-            target_s_m = float(msg.data[0])
-            execute_probability = float(msg.data[1])
-        except (TypeError, ValueError):
-            self.get_logger().warn("ignoring rollout prediction with non-numeric values")
-            self._clear_rollout_filter()
-            return
-
-        if not _all_finite((target_s_m, execute_probability)):
-            self.get_logger().warn("ignoring non-finite rollout prediction")
-            self._clear_rollout_filter()
-            return
-
-        if execute_probability < 0.0 or execute_probability > 1.0:
-            self.get_logger().warn(
-                "ignoring rollout prediction with probability outside [0, 1]"
+        target_s_m = float(msg.data)
+        if not math.isfinite(target_s_m):
+            self._warn_throttled(
+                "rollout_non_finite",
+                "ignoring non-finite rollout target scalar",
+                period_sec=1.0,
             )
-            self._clear_rollout_filter()
             return
 
         min_target = float(self.get_parameter("rollout_min_target_s_m").value)
         max_target = float(self.get_parameter("rollout_max_target_s_m").value)
         if target_s_m < min_target or target_s_m > max_target:
-            self.get_logger().warn(
-                "ignoring rollout prediction outside configured target_s bounds"
+            self._warn_throttled(
+                "rollout_oob",
+                "ignoring rollout prediction outside configured target_s bounds",
+                period_sec=1.0,
             )
-            self._clear_rollout_filter()
             return
 
-        max_gap_sec = float(self.get_parameter("rollout_max_prediction_gap_sec").value)
-        if (
-            self._rollout_last_receive_time_sec is not None
-            and (now_sec - self._rollout_last_receive_time_sec) > max_gap_sec
-        ):
-            self._clear_rollout_filter()
-
-        self._rollout_last_receive_time_sec = now_sec
-
-        threshold = float(self.get_parameter("rollout_execute_threshold").value)
-        if execute_probability < threshold:
-            self._clear_rollout_filter()
-            return
-
-        self._rollout_predictions.append((target_s_m, execute_probability))
-
-        required = int(self.get_parameter("rollout_required_consecutive").value)
-        if len(self._rollout_predictions) < required:
-            return
-
-        recent = list(self._rollout_predictions)[-required:]
-        targets = [target for target, _probability in recent]
-        probabilities = [probability for _target, probability in recent]
-        target_spread_m = max(targets) - min(targets)
-
-        while len(self._rollout_predictions) > required:
-            self._rollout_predictions.popleft()
-
-        max_spread_m = float(self.get_parameter("rollout_max_target_spread_m").value)
-        if target_spread_m > max_spread_m and not math.isclose(
-            target_spread_m,
-            max_spread_m,
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        ):
-            return
-
-        final_target_s = float(statistics.median(targets))
+        self._rollout_last_valid_receive_time_sec = now_sec
+        self._latest_rollout_target_s = float(target_s_m)
+        self._publish_selected_goto_s(float(target_s_m), self._generation)
+        mode = "dry-run" if self._get_dry_run() else "live"
         self.get_logger().info(
-            "stable rollout prediction accepted: "
-            f"threshold={threshold:.3f}, "
-            f"probabilities={probabilities}, "
-            f"count={required}, "
-            f"target_s={final_target_s:.6f}, "
-            f"spread={target_spread_m:.6f}"
+            f"accepted rollout target_s={target_s_m:.6f} mode={mode} generation={self._generation}"
         )
-        self._clear_rollout_filter()
-        self._send_goto_s_goal(final_target_s, self._generation)
+
+        if self._get_dry_run():
+            return
+
+        self._execution_backend.update_target(float(target_s_m), self._generation)
 
     def _on_projection_done(self, future: Any, generation: int) -> None:
         if generation != self._generation:
@@ -985,23 +1091,12 @@ class InterceptionController(Node):
         if hasattr(goal, field):
             setattr(goal, field, value)
 
-    def _publish_selected_goto_s_once(self, s: float, generation: int) -> None:
-        if generation != self._generation:
-            return
-        if self._selected_goto_s_publish_generation == generation:
-            return
-
-        msg = Float64()
-        msg.data = float(s)
-        self._selected_goto_s_pub.publish(msg)
-        self._selected_goto_s_publish_generation = generation
-
     def _send_goto_s_goal(self, s: float, generation: int) -> None:
         if generation != self._generation:
             self._clear_pending_publish_data(generation)
             return
 
-        self._publish_selected_goto_s_once(s, generation)
+        self._publish_selected_goto_s(s, generation)
 
         if self._execution_backend.backend_name == "cont_tracker" and self._execution_backend.is_active():
             self._execution_backend.update_target(float(s), generation)
@@ -1148,6 +1243,64 @@ class InterceptionController(Node):
         self._freeze(f"backend error: {error}", error=True)
 
     def _check_wait_timeout(self) -> None:
+        if self._command_source == "rollout":
+            if self._rollout_reset_pending:
+                if self._rollout_reset_request_start_sec is None:
+                    return
+                timeout_sec = float(self.get_parameter("rollout_reset_timeout_sec").value)
+                elapsed = self._now_sec() - self._rollout_reset_request_start_sec
+                if elapsed > timeout_sec:
+                    self._freeze(
+                        f"rollout reset acknowledgement timeout after {elapsed:.3f}s (limit {timeout_sec:.3f}s)",
+                        error=True,
+                    )
+                return
+
+            if self._state not in {
+                InterceptionState.ARMED_WAITING,
+                InterceptionState.SENDING_ACTION,
+                InterceptionState.EXECUTING,
+            }:
+                return
+
+            timeout_sec = float(self.get_parameter("rollout_prediction_timeout_sec").value)
+            now_sec = self._now_sec()
+
+            if self._rollout_last_valid_receive_time_sec is None:
+                if self._arm_time_sec is None:
+                    return
+                elapsed = now_sec - self._arm_time_sec
+                if elapsed > timeout_sec:
+                    self._warn_throttled(
+                        "rollout_first_prediction_timeout",
+                        (
+                            "rollout watchdog timeout waiting for first valid scalar: "
+                            f"elapsed={elapsed:.3f}s timeout={timeout_sec:.3f}s"
+                        ),
+                        period_sec=1.0,
+                    )
+                    self._freeze(
+                        f"timed out waiting for first valid rollout scalar after {elapsed:.3f}s",
+                        error=True,
+                    )
+                return
+
+            gap = now_sec - self._rollout_last_valid_receive_time_sec
+            if gap > timeout_sec:
+                self._warn_throttled(
+                    "rollout_prediction_gap_timeout",
+                    (
+                        "rollout watchdog timeout: "
+                        f"last valid scalar age={gap:.3f}s timeout={timeout_sec:.3f}s"
+                    ),
+                    period_sec=1.0,
+                )
+                self._freeze(
+                    f"rollout scalar stream timed out: age={gap:.3f}s > {timeout_sec:.3f}s",
+                    error=True,
+                )
+            return
+
         if self._state != InterceptionState.ARMED_WAITING:
             return
 
@@ -1166,6 +1319,28 @@ class InterceptionController(Node):
             )
 
     def _publish_status(self) -> None:
+        now_sec = self._now_sec()
+        rollout_stream_age = "n/a"
+        if self._rollout_last_valid_receive_time_sec is not None:
+            rollout_stream_age = f"{(now_sec - self._rollout_last_valid_receive_time_sec):.3f}s"
+
+        has_valid_current_tcp_s = self._latest_current_tcp_s_if_fresh() is not None
+        current_tcp_s_age = "n/a"
+        if self._latest_current_tcp_s_receive_time_sec is not None:
+            current_tcp_s_age = f"{(now_sec - self._latest_current_tcp_s_receive_time_sec):.3f}s"
+
+        latest_rollout_target = "n/a"
+        if self._latest_rollout_target_s is not None:
+            latest_rollout_target = f"{self._latest_rollout_target_s:.6f}"
+
+        reset_ack_age = "n/a"
+        if self._rollout_reset_ack_time_sec is not None:
+            reset_ack_age = f"{(now_sec - self._rollout_reset_ack_time_sec):.3f}s"
+
+        reset_epoch = "n/a"
+        if self._rollout_last_ack_epoch is not None:
+            reset_epoch = str(self._rollout_last_ack_epoch)
+
         msg = String()
         msg.data = (
             f"state={self._state.value}; "
@@ -1173,9 +1348,16 @@ class InterceptionController(Node):
             f"command_source={self._command_source}; "
             f"execution_backend={self._execution_backend.backend_name}; "
             f"dry_run={self._get_dry_run()}; "
-            f"rollout_count={self._rollout_qualifying_count()}; "
-            f"rollout_required_consecutive={int(self.get_parameter('rollout_required_consecutive').value)}; "
-            f"rollout_execute_threshold={float(self.get_parameter('rollout_execute_threshold').value):.3f}; "
+            f"rollout_stream_age={rollout_stream_age}; "
+            f"rollout_prediction_timeout_sec={float(self.get_parameter('rollout_prediction_timeout_sec').value):.3f}; "
+            f"has_valid_current_tcp_s={has_valid_current_tcp_s}; "
+            f"current_tcp_s_age={current_tcp_s_age}; "
+            f"latest_rollout_target_s={latest_rollout_target}; "
+            f"rollout_reset_service={self.get_parameter('rollout_reset_service').value}; "
+            f"rollout_reset_pending={self._rollout_reset_pending}; "
+            f"rollout_last_ack_epoch={reset_epoch}; "
+            f"rollout_reset_ack_age={reset_ack_age}; "
+            f"rollout_predictions_accepted={self._rollout_predictions_accepted}; "
             f"info={self._last_info}; "
             f"last_error={self._last_error}"
         )

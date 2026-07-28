@@ -34,11 +34,9 @@ def generate_launch_description() -> LaunchDescription:
     status_publish_rate_hz = LaunchConfiguration("status_publish_rate_hz")
     debug_log = LaunchConfiguration("debug_log")
     rollout_prediction_topic = LaunchConfiguration("rollout_prediction_topic")
-    rollout_execute_threshold = LaunchConfiguration("rollout_execute_threshold")
-    rollout_required_consecutive = LaunchConfiguration("rollout_required_consecutive")
-    rollout_max_prediction_gap_sec = LaunchConfiguration("rollout_max_prediction_gap_sec")
-    rollout_max_target_spread_m = LaunchConfiguration("rollout_max_target_spread_m")
-    rollout_post_arm_ignore_sec = LaunchConfiguration("rollout_post_arm_ignore_sec")
+    current_tcp_s_topic = LaunchConfiguration("current_tcp_s_topic")
+    max_current_tcp_s_age_sec = LaunchConfiguration("max_current_tcp_s_age_sec")
+    rollout_prediction_timeout_sec = LaunchConfiguration("rollout_prediction_timeout_sec")
     rollout_min_target_s_m = LaunchConfiguration("rollout_min_target_s_m")
     rollout_max_target_s_m = LaunchConfiguration("rollout_max_target_s_m")
 
@@ -77,11 +75,9 @@ def generate_launch_description() -> LaunchDescription:
                 "status_publish_rate_hz": status_publish_rate_hz,
                 "debug_log": debug_log,
                 "rollout_prediction_topic": rollout_prediction_topic,
-                "rollout_execute_threshold": rollout_execute_threshold,
-                "rollout_required_consecutive": rollout_required_consecutive,
-                "rollout_max_prediction_gap_sec": rollout_max_prediction_gap_sec,
-                "rollout_max_target_spread_m": rollout_max_target_spread_m,
-                "rollout_post_arm_ignore_sec": rollout_post_arm_ignore_sec,
+                "current_tcp_s_topic": current_tcp_s_topic,
+                "max_current_tcp_s_age_sec": max_current_tcp_s_age_sec,
+                "rollout_prediction_timeout_sec": rollout_prediction_timeout_sec,
                 "rollout_min_target_s_m": rollout_min_target_s_m,
                 "rollout_max_target_s_m": rollout_max_target_s_m,
             }
@@ -178,14 +174,12 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("require_reset_service", default_value="true"),
             DeclareLaunchArgument("status_publish_rate_hz", default_value="2.0"),
             DeclareLaunchArgument("debug_log", default_value="false"),
-            DeclareLaunchArgument("rollout_prediction_topic", default_value="/act/intercept_prediction"),
-            DeclareLaunchArgument("rollout_execute_threshold", default_value="0.90"),
-            DeclareLaunchArgument("rollout_required_consecutive", default_value="3"),
-            DeclareLaunchArgument("rollout_max_prediction_gap_sec", default_value="0.25"),
-            DeclareLaunchArgument("rollout_max_target_spread_m", default_value="0.02"),
-            DeclareLaunchArgument("rollout_post_arm_ignore_sec", default_value="0.25"),
-            DeclareLaunchArgument("rollout_min_target_s_m", default_value="0.0"),
-            DeclareLaunchArgument("rollout_max_target_s_m", default_value="0.0"),
+            DeclareLaunchArgument("rollout_prediction_topic", default_value="/act/intercept_prediction_current_abs_s"),
+            DeclareLaunchArgument("current_tcp_s_topic", default_value="/middle_line/current_tcp_s"),
+            DeclareLaunchArgument("max_current_tcp_s_age_sec", default_value="0.15"),
+            DeclareLaunchArgument("rollout_prediction_timeout_sec", default_value="0.25"),
+            DeclareLaunchArgument("rollout_min_target_s_m", default_value="-0.15"),
+            DeclareLaunchArgument("rollout_max_target_s_m", default_value="0.15"),
             interception_node,
         ]
     )

@@ -203,6 +203,13 @@ class ContTrackerBackend(_ActionBackend):
     def target_publisher(self) -> Any:
         return self._target_pub
 
+    def shutdown(self) -> None:
+        super().shutdown()
+        self._latest_pending_target_s = None
+        self._last_published_target_s = None
+        self._goal_started_target_s = None
+        self._goal_accepted = False
+
     def start(self, request: GoalRequest) -> None:
         if self.is_active():
             return
