@@ -13,6 +13,12 @@ import rclpy
 from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import PointStamped, PoseStamped
 from rclpy.node import Node
+from rclpy.qos import (
+    QoSDurabilityPolicy,
+    QoSHistoryPolicy,
+    QoSProfile,
+    QoSReliabilityPolicy,
+)
 from std_msgs.msg import Float64, String
 from std_srvs.srv import SetBool, Trigger
 
@@ -323,12 +329,25 @@ class InterceptionController(Node):
             self._handle_rollout_prediction,
             1,
         )
-        self._current_tcp_s_sub = self.create_subscription(
-            Float64,
-            str(self.get_parameter("current_tcp_s_topic").value),
-            self._handle_current_tcp_s,
-            10,
-        )
+        if self._command_source == "rollout":
+            # current_tcp_s is high-rate latest-state telemetry used only by rollout mode
+            # during live arming after rollout-reset acknowledgement.
+            current_tcp_s_qos = QoSProfile(
+                history=QoSHistoryPolicy.KEEP_LAST,
+                depth=1,
+                reliability=QoSReliabilityPolicy.BEST_EFFORT,
+                durability=QoSDurabilityPolicy.VOLATILE,
+            )
+            self._current_tcp_s_sub = self.create_subscription(
+                Float64,
+                str(self.get_parameter("current_tcp_s_topic").value),
+                self._handle_current_tcp_s,
+                current_tcp_s_qos,
+            )
+        else:
+            # Scene mode projects Cartesian intercept poses to line coordinates and
+            # does not consume /middle_line/current_tcp_s.
+            self._current_tcp_s_sub = None
 
         self._table_pose_sub = self.create_subscription(
             PoseStamped,

@@ -117,6 +117,7 @@ class FakeNode:
         self._parameters = {}
         self._clock = FakeClock()
         self._logger = FakeLogger()
+        self._subscriptions = []
 
     def declare_parameter(self, name, value):
         self._parameters[name] = value
@@ -133,9 +134,11 @@ class FakeNode:
         del srv_type, callback
         return types.SimpleNamespace(name=name)
 
-    def create_subscription(self, msg_type, topic, callback, depth):
-        del msg_type, callback, depth
-        return types.SimpleNamespace(topic=topic)
+    def create_subscription(self, msg_type, topic, callback, qos):
+        del msg_type, callback
+        sub = types.SimpleNamespace(topic=topic, qos=qos)
+        self._subscriptions.append(sub)
+        return sub
 
     def create_publisher(self, msg_type, topic, depth):
         del msg_type, depth
@@ -209,6 +212,28 @@ class FakeFloat64:
         self.data = 0.0
 
 
+class FakeQoSHistoryPolicy:
+    KEEP_LAST = "KEEP_LAST"
+
+
+class FakeQoSReliabilityPolicy:
+    BEST_EFFORT = "BEST_EFFORT"
+    RELIABLE = "RELIABLE"
+
+
+class FakeQoSDurabilityPolicy:
+    VOLATILE = "VOLATILE"
+    TRANSIENT_LOCAL = "TRANSIENT_LOCAL"
+
+
+class FakeQoSProfile:
+    def __init__(self, history, depth, reliability, durability):
+        self.history = history
+        self.depth = depth
+        self.reliability = reliability
+        self.durability = durability
+
+
 class FakeTriggerRequest:
     pass
 
@@ -278,6 +303,7 @@ def controller_module():
     modules = {
         "rclpy": types.ModuleType("rclpy"),
         "rclpy.node": types.ModuleType("rclpy.node"),
+        "rclpy.qos": types.ModuleType("rclpy.qos"),
         "rclpy.action": types.ModuleType("rclpy.action"),
         "action_msgs": types.ModuleType("action_msgs"),
         "action_msgs.msg": types.ModuleType("action_msgs.msg"),
@@ -296,6 +322,10 @@ def controller_module():
     modules["rclpy"].shutdown = lambda: None
     modules["rclpy"].spin = lambda node: None
     modules["rclpy.node"].Node = FakeNode
+    modules["rclpy.qos"].QoSProfile = FakeQoSProfile
+    modules["rclpy.qos"].QoSHistoryPolicy = FakeQoSHistoryPolicy
+    modules["rclpy.qos"].QoSReliabilityPolicy = FakeQoSReliabilityPolicy
+    modules["rclpy.qos"].QoSDurabilityPolicy = FakeQoSDurabilityPolicy
     modules["rclpy.action"].ActionClient = FakeActionClient
     modules["action_msgs.msg"].GoalStatus = types.SimpleNamespace(STATUS_SUCCEEDED=4)
     modules["geometry_msgs.msg"].PointStamped = FakePointStamped
@@ -317,6 +347,28 @@ def controller(controller_module):
     node = controller_module.InterceptionController()
     node.get_clock().current_time_sec = 100.0
     return node
+
+
+def create_controller_with_command_source(controller_module, command_source: str):
+    original_declare = FakeNode.declare_parameter
+
+    def declare_with_source(self, name, value):
+        if name == "command_source":
+            value = command_source
+        return original_declare(self, name, value)
+
+    FakeNode.declare_parameter = declare_with_source
+    try:
+        node = controller_module.InterceptionController()
+    finally:
+        FakeNode.declare_parameter = original_declare
+    node.get_clock().current_time_sec = 100.0
+    return node
+
+
+@pytest.fixture()
+def rollout_controller(controller_module):
+    return create_controller_with_command_source(controller_module, "rollout")
 
 
 def set_param(controller, name, value):
@@ -358,6 +410,22 @@ def test_default_command_source_is_scene(controller):
     assert controller._command_source == "scene"
 
 
+def test_scene_controller_does_not_subscribe_current_tcp_s(controller):
+    assert controller._command_source == "scene"
+    assert controller._current_tcp_s_sub is None
+
+
+def test_rollout_controller_subscribes_current_tcp_s_with_best_effort_qos(controller_module, rollout_controller):
+    assert rollout_controller._command_source == "rollout"
+    sub = rollout_controller._current_tcp_s_sub
+    assert sub is not None
+    assert sub.topic == rollout_controller.get_parameter("current_tcp_s_topic").value
+    assert sub.qos.reliability == controller_module.QoSReliabilityPolicy.BEST_EFFORT
+    assert sub.qos.history == controller_module.QoSHistoryPolicy.KEEP_LAST
+    assert sub.qos.depth == 1
+    assert sub.qos.durability == controller_module.QoSDurabilityPolicy.VOLATILE
+
+
 def test_scene_behavior_is_unchanged_by_default(controller_module, controller):
     controller._state = controller_module.InterceptionState.ARMED_WAITING
     controller._waiting_start_time_sec = 99.0
@@ -367,6 +435,92 @@ def test_scene_behavior_is_unchanged_by_default(controller_module, controller):
 
     assert controller._state == controller_module.InterceptionState.PROJECTING
     assert len(controller._project_client.calls) == 1
+
+
+def test_scene_pose_handling_still_calls_project_point_to_line(controller_module, controller):
+    controller._state = controller_module.InterceptionState.ARMED_WAITING
+    controller._waiting_start_time_sec = 99.0
+    controller._accept_after_time_sec = 0.0
+
+    controller._handle_intercept_pose(make_pose(controller_module))
+
+    assert len(controller._project_client.calls) == 1
+
+
+def test_live_rollout_arming_rejects_missing_current_tcp_s(controller_module, rollout_controller):
+    set_param(rollout_controller, "dry_run", False)
+    response = controller_module.Trigger.Response()
+
+    rollout_controller._handle_arm(controller_module.Trigger.Request(), response)
+
+    assert response.success is True
+    assert rollout_controller._state == controller_module.InterceptionState.ROLLOUT_RESET_PENDING
+    rollout_controller._on_rollout_reset_done(
+        FakeFuture(types.SimpleNamespace(success=True, message="rollout_epoch=11")),
+        rollout_controller._generation,
+        False,
+    )
+
+    assert rollout_controller._state == controller_module.InterceptionState.FROZEN
+    assert "requires a fresh finite /middle_line/current_tcp_s" in rollout_controller._last_error
+
+
+def test_live_rollout_arming_rejects_stale_current_tcp_s(controller_module, rollout_controller):
+    set_param(rollout_controller, "dry_run", False)
+    set_param(rollout_controller, "max_current_tcp_s_age_sec", 0.10)
+    rollout_controller._latest_current_tcp_s = 0.02
+    rollout_controller._latest_current_tcp_s_receive_time_sec = 99.0
+    response = controller_module.Trigger.Response()
+
+    rollout_controller._handle_arm(controller_module.Trigger.Request(), response)
+    rollout_controller._on_rollout_reset_done(
+        FakeFuture(types.SimpleNamespace(success=True, message="rollout_epoch=12")),
+        rollout_controller._generation,
+        False,
+    )
+
+    assert rollout_controller._state == controller_module.InterceptionState.FROZEN
+    assert "requires a fresh finite /middle_line/current_tcp_s" in rollout_controller._last_error
+
+
+def test_live_rollout_arming_accepts_fresh_finite_in_bounds_current_tcp_s(controller_module, rollout_controller):
+    set_param(rollout_controller, "dry_run", False)
+    set_param(rollout_controller, "rollout_min_target_s_m", -0.15)
+    set_param(rollout_controller, "rollout_max_target_s_m", 0.15)
+    rollout_controller._latest_current_tcp_s = 0.03
+    rollout_controller._latest_current_tcp_s_receive_time_sec = rollout_controller._now_sec()
+    sent = []
+    rollout_controller._send_goto_s_goal = lambda s, generation: sent.append((s, generation))
+    response = controller_module.Trigger.Response()
+
+    rollout_controller._handle_arm(controller_module.Trigger.Request(), response)
+    rollout_controller._on_rollout_reset_done(
+        FakeFuture(types.SimpleNamespace(success=True, message="rollout_epoch=13")),
+        rollout_controller._generation,
+        False,
+    )
+
+    assert sent == [(0.03, rollout_controller._generation)]
+    assert rollout_controller._selected_goto_s_pub.messages[-1].data == pytest.approx(0.03)
+
+
+def test_rollout_dry_run_arming_does_not_depend_on_current_tcp_s(controller_module, rollout_controller):
+    set_param(rollout_controller, "dry_run", True)
+    rollout_controller._latest_current_tcp_s = None
+    rollout_controller._latest_current_tcp_s_receive_time_sec = None
+    sent = []
+    rollout_controller._send_goto_s_goal = lambda s, generation: sent.append((s, generation))
+    response = controller_module.Trigger.Response()
+
+    rollout_controller._handle_arm(controller_module.Trigger.Request(), response)
+    rollout_controller._on_rollout_reset_done(
+        FakeFuture(types.SimpleNamespace(success=True, message="rollout_epoch=14")),
+        rollout_controller._generation,
+        True,
+    )
+
+    assert rollout_controller._state == controller_module.InterceptionState.ARMED_WAITING
+    assert sent == []
 
 
 def test_rollout_messages_are_ignored_in_scene_mode(controller_module, controller):
