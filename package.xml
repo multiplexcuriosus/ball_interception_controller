@@ -13,6 +13,7 @@
   <depend>std_srvs</depend>
   <depend>geometry_msgs</depend>
   <depend>fr3_husky_msgs</depend>
+  <depend>intercept_latency_monitor</depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
 

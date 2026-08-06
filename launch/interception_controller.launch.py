@@ -39,6 +39,9 @@ def generate_launch_description() -> LaunchDescription:
     rollout_prediction_timeout_sec = LaunchConfiguration("rollout_prediction_timeout_sec")
     rollout_min_target_s_m = LaunchConfiguration("rollout_min_target_s_m")
     rollout_max_target_s_m = LaunchConfiguration("rollout_max_target_s_m")
+    enable_latency_trace = LaunchConfiguration("enable_latency_trace")
+    latency_trace_topic = LaunchConfiguration("latency_trace_topic")
+    latency_run_id = LaunchConfiguration("latency_run_id")
 
     interception_node = Node(
         package="ball_interception_controller",
@@ -80,6 +83,9 @@ def generate_launch_description() -> LaunchDescription:
                 "rollout_prediction_timeout_sec": rollout_prediction_timeout_sec,
                 "rollout_min_target_s_m": rollout_min_target_s_m,
                 "rollout_max_target_s_m": rollout_max_target_s_m,
+                "enable_latency_trace": enable_latency_trace,
+                "latency_trace_topic": latency_trace_topic,
+                "latency_run_id": latency_run_id,
             }
         ],
     )
@@ -180,6 +186,11 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("rollout_prediction_timeout_sec", default_value="0.25"),
             DeclareLaunchArgument("rollout_min_target_s_m", default_value="-0.15"),
             DeclareLaunchArgument("rollout_max_target_s_m", default_value="0.15"),
+            DeclareLaunchArgument("enable_latency_trace", default_value="false"),
+            DeclareLaunchArgument(
+                "latency_trace_topic", default_value="/intercept_trace/controller"
+            ),
+            DeclareLaunchArgument("latency_run_id", default_value=""),
             interception_node,
         ]
     )

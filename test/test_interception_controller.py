@@ -154,6 +154,9 @@ class FakeNode:
     def get_clock(self):
         return self._clock
 
+    def get_name(self):
+        return self._node_name
+
     def destroy_node(self):
         return None
 
@@ -210,6 +213,10 @@ class FakeFloat32MultiArray:
 class FakeFloat64:
     def __init__(self):
         self.data = 0.0
+
+
+class FakeLatencyTrace:
+    pass
 
 
 class FakeQoSHistoryPolicy:
@@ -316,6 +323,8 @@ def controller_module():
         "fr3_husky_msgs": types.ModuleType("fr3_husky_msgs"),
         "fr3_husky_msgs.srv": types.ModuleType("fr3_husky_msgs.srv"),
         "fr3_husky_msgs.action": types.ModuleType("fr3_husky_msgs.action"),
+        "intercept_latency_monitor": types.ModuleType("intercept_latency_monitor"),
+        "intercept_latency_monitor.msg": types.ModuleType("intercept_latency_monitor.msg"),
     }
 
     modules["rclpy"].init = lambda args=None: None
@@ -337,6 +346,7 @@ def controller_module():
     modules["std_srvs.srv"].SetBool = FakeSetBool
     modules["fr3_husky_msgs.srv"].ProjectPointToLine = FakeProjectPointToLine
     modules["fr3_husky_msgs.action"].LineTrajectory = FakeAction
+    modules["intercept_latency_monitor.msg"].LatencyTrace = FakeLatencyTrace
 
     sys.modules.update(modules)
     return importlib.import_module("ball_interception_controller.interception_controller")
@@ -358,6 +368,21 @@ def create_controller_with_command_source(controller_module, command_source: str
         return original_declare(self, name, value)
 
     FakeNode.declare_parameter = declare_with_source
+    try:
+        node = controller_module.InterceptionController()
+    finally:
+        FakeNode.declare_parameter = original_declare
+    node.get_clock().current_time_sec = 100.0
+    return node
+
+
+def create_controller_with_parameters(controller_module, **overrides):
+    original_declare = FakeNode.declare_parameter
+
+    def declare_with_overrides(self, name, value):
+        return original_declare(self, name, overrides.get(name, value))
+
+    FakeNode.declare_parameter = declare_with_overrides
     try:
         node = controller_module.InterceptionController()
     finally:
@@ -800,3 +825,93 @@ def test_scene_mode_without_required_reset_skips_ready_reset(controller_module, 
     assert response.success is True
     assert controller._reset_client.calls == []
     assert controller._state == controller_module.InterceptionState.ARMED_WAITING
+
+
+def trace_events(node):
+    return [(msg.stage, msg.event, msg.valid) for msg in node._latency_trace_pub.messages]
+
+
+def test_latency_tracing_disabled_creates_no_publisher(controller_module, controller):
+    assert controller.get_parameter("enable_latency_trace").value is False
+    assert controller._latency_trace_pub is None
+    controller._state = controller_module.InterceptionState.ARMED_WAITING
+    controller._accept_after_time_sec = 0.0
+    controller._handle_intercept_pose(make_pose(controller_module))
+    assert len(controller._project_client.calls) == 1
+
+
+def test_scene_trace_records_receipt_rejection_and_decision(controller_module):
+    node = create_controller_with_parameters(
+        controller_module, enable_latency_trace=True, latency_run_id="scene-run"
+    )
+    node._state = controller_module.InterceptionState.ARMED_WAITING
+    node._accept_after_time_sec = 0.0
+    node._handle_intercept_pose(make_pose(controller_module, frame_id="wrong"))
+
+    events = trace_events(node)
+    assert ("input", "scene_input_received", True) in events
+    assert ("gating", "rejected", False) in events
+    assert ("decision", "end", False) in events
+    assert all(
+        msg.run_id == "scene-run" and msg.modality == "scene"
+        for msg in node._latency_trace_pub.messages
+    )
+    assert "frame_mismatch" in node._latency_trace_pub.messages[-2].detail_json
+
+
+def test_scene_trace_records_accepted_target_and_submission(controller_module):
+    node = create_controller_with_parameters(
+        controller_module, enable_latency_trace=True, dry_run=False,
+        execution_backend="goto_s",
+    )
+    node._state = controller_module.InterceptionState.ARMED_WAITING
+    node._accept_after_time_sec = 0.0
+    node._handle_intercept_pose(make_pose(controller_module))
+    result = types.SimpleNamespace(
+        success=True, s=0.12, cross_track_error_m=0.001, line_half_length_m=0.2,
+    )
+    node._on_projection_done(FakeFuture(result), node._generation)
+
+    events = trace_events(node)
+    assert ("decision", "end", True) in events
+    assert ("selection", "target_created", True) in events
+    assert ("command", "goto_s_submitted", True) in events
+    selected = next(
+        msg for msg in node._latency_trace_pub.messages
+        if msg.event == "target_created"
+    )
+    assert selected.scalar_value == pytest.approx(0.12)
+
+    node.on_backend_goal_accepted(
+        "goto_s", node._generation, FakeGoalHandle()
+    )
+    acknowledgement = next(
+        msg for msg in node._latency_trace_pub.messages
+        if msg.event == "target_acceptance_acknowledged"
+    )
+    assert acknowledgement.scalar_value == pytest.approx(0.12)
+
+
+def test_rollout_trace_records_accepted_and_rejected_predictions(controller_module):
+    node = create_controller_with_parameters(
+        controller_module, enable_latency_trace=True, command_source="rollout", dry_run=True,
+    )
+    node._state = controller_module.InterceptionState.ARMED_WAITING
+    node._rollout_predictions_accepted = True
+    node._rollout_post_reset_guard_until_sec = 0.0
+
+    bad = controller_module.Float64()
+    bad.data = 2.0
+    node._handle_rollout_prediction(bad)
+    good = controller_module.Float64()
+    good.data = 0.05
+    node._handle_rollout_prediction(good)
+
+    events = trace_events(node)
+    assert ("input", "act_rollout_prediction_received", True) in events
+    assert ("gating", "rejected", False) in events
+    assert ("decision", "end", True) in events
+    assert ("selection", "target_created", True) in events
+    rejection = next(msg for msg in node._latency_trace_pub.messages if not msg.valid)
+    assert "target_out_of_bounds" in rejection.detail_json
+    assert "probability_available" in rejection.detail_json
