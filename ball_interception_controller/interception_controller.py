@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import importlib
+import json
 import math
 import re
 import threading
+import time
 from enum import Enum
 from typing import Any, Dict, Optional, Tuple, Type
 
@@ -23,6 +25,7 @@ from std_msgs.msg import Float64, String
 from std_srvs.srv import SetBool, Trigger
 
 from fr3_husky_msgs.srv import ProjectPointToLine
+from intercept_latency_monitor.msg import LatencyTrace
 
 from ball_interception_controller.execution_backends import (
     ContTrackerBackend,
@@ -210,6 +213,9 @@ class InterceptionController(Node):
         self.declare_parameter("rollout_reset_timeout_sec", 0.75)
         self.declare_parameter("rollout_post_reset_guard_sec", 0.05)
         self.declare_parameter("dry_run", True)
+        self.declare_parameter("enable_latency_trace", False)
+        self.declare_parameter("latency_trace_topic", "/intercept_trace/controller")
+        self.declare_parameter("latency_run_id", "")
 
         action_type_string = str(self.get_parameter("trajectory_action_type").value)
         try:
@@ -247,6 +253,14 @@ class InterceptionController(Node):
         self._rollout_reset_ack_time_sec: Optional[float] = None
         self._rollout_last_ack_epoch: Optional[int] = None
         self._rollout_post_reset_guard_until_sec: Optional[float] = None
+        self._latency_trace_enabled = bool(self.get_parameter("enable_latency_trace").value)
+        self._latency_sequence = 0
+        self._active_trace_sequence = 0
+        self._active_trace_source_stamp_ns = 0
+        self._active_trace_receipt_ns = 0
+        self._active_trace_start_ns = 0
+        self._active_trace_start_steady_ns = 0
+        self._latest_selected_target_s: Optional[float] = None
 
         self._latest_table_t_base_table: Optional[Tuple[float, float, float]] = None
         self._latest_table_r_base_table: Optional[
@@ -371,6 +385,19 @@ class InterceptionController(Node):
             str(self.get_parameter("commanded_target_table_topic").value),
             10,
         )
+        self._latency_trace_pub = None
+        if self._latency_trace_enabled:
+            trace_qos = QoSProfile(
+                history=QoSHistoryPolicy.KEEP_LAST,
+                depth=10,
+                reliability=QoSReliabilityPolicy.BEST_EFFORT,
+                durability=QoSDurabilityPolicy.VOLATILE,
+            )
+            self._latency_trace_pub = self.create_publisher(
+                LatencyTrace,
+                str(self.get_parameter("latency_trace_topic").value),
+                trace_qos,
+            )
 
         status_hz = max(0.2, float(self.get_parameter("status_publish_rate_hz").value))
         self._status_timer = self.create_timer(1.0 / status_hz, self._publish_status)
@@ -396,6 +423,93 @@ class InterceptionController(Node):
     def _get_dry_run(self) -> bool:
         with self._mode_lock:
             return bool(self._dry_run)
+
+    def _trace_input(self, event: str, source_stamp_ns: int = 0) -> int:
+        """Start a trace sequence for one source callback and record receipt."""
+        if not self._latency_trace_enabled:
+            return 0
+        self._latency_sequence += 1
+        sequence = self._latency_sequence
+        receipt_ns = self.get_clock().now().nanoseconds
+        self._active_trace_sequence = sequence
+        self._active_trace_source_stamp_ns = source_stamp_ns
+        self._active_trace_receipt_ns = receipt_ns
+        self._active_trace_start_ns = 0
+        self._active_trace_start_steady_ns = time.monotonic_ns()
+        self._trace(
+            "input", event, sequence=sequence, source_stamp_ns=source_stamp_ns,
+            receipt_ns=receipt_ns, start_ns=receipt_ns, end_ns=receipt_ns,
+        )
+        return sequence
+
+    def _trace_decision_start(self, sequence: int) -> None:
+        if not self._latency_trace_enabled:
+            return
+        self._active_trace_start_ns = self.get_clock().now().nanoseconds
+        self._active_trace_start_steady_ns = time.monotonic_ns()
+        self._trace(
+            "decision", "start", sequence=sequence,
+            receipt_ns=self._active_trace_receipt_ns,
+            start_ns=self._active_trace_start_ns,
+        )
+
+    def _trace(
+        self,
+        stage: str,
+        event: str,
+        *,
+        valid: bool = True,
+        detail: Optional[Dict[str, Any]] = None,
+        scalar_value: float = 0.0,
+        sequence: Optional[int] = None,
+        source_stamp_ns: Optional[int] = None,
+        receipt_ns: Optional[int] = None,
+        start_ns: Optional[int] = None,
+        end_ns: Optional[int] = None,
+    ) -> None:
+        """Publish a best-effort trace; the disabled path is one boolean check."""
+        if not self._latency_trace_enabled or self._latency_trace_pub is None:
+            return
+        now_ns = self.get_clock().now().nanoseconds
+        steady_ns = time.monotonic_ns()
+        msg = LatencyTrace()
+        msg.run_id = str(self.get_parameter("latency_run_id").value)
+        msg.stage = stage
+        msg.event = event
+        msg.modality = self._command_source
+        msg.node_name = self.get_name()
+        resolved_sequence = self._active_trace_sequence if sequence is None else sequence
+        if not resolved_sequence:
+            self._latency_sequence += 1
+            resolved_sequence = self._latency_sequence
+        msg.sequence = int(resolved_sequence)
+        msg.parent_sequence = 0
+        source_ns = self._active_trace_source_stamp_ns if source_stamp_ns is None else source_stamp_ns
+        msg.source_stamp_ns = int(source_ns)
+        msg.receipt_ros_stamp_ns = int(
+            self._active_trace_receipt_ns if receipt_ns is None else receipt_ns
+        )
+        msg.start_ros_stamp_ns = int(self._active_trace_start_ns if start_ns is None else start_ns)
+        msg.end_ros_stamp_ns = int(now_ns if end_ns is None else end_ns)
+        msg.start_steady_ns = self._active_trace_start_steady_ns or steady_ns
+        msg.end_steady_ns = steady_ns
+        msg.valid = bool(valid)
+        msg.scalar_value = float(scalar_value)
+        payload = {"source": self._command_source}
+        if detail:
+            payload.update(detail)
+        msg.detail_json = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+        self._latency_trace_pub.publish(msg)
+
+    def _trace_rejection(self, reason: str, **detail: Any) -> None:
+        detail["rejection_reason"] = reason
+        self._trace("gating", "rejected", valid=False, detail=detail)
+
+    def _trace_decision_end(self, valid: bool, reason: str = "") -> None:
+        detail = {"outcome": "accepted" if valid else "rejected"}
+        if reason:
+            detail["rejection_reason"] = reason
+        self._trace("decision", "end", valid=valid, detail=detail)
 
     def _set_dry_run(self, dry_run: bool) -> None:
         with self._mode_lock:
@@ -467,6 +581,11 @@ class InterceptionController(Node):
         msg = Float64()
         msg.data = float(s)
         self._selected_goto_s_pub.publish(msg)
+        self._latest_selected_target_s = float(s)
+        self._trace(
+            "selection", "target_created", scalar_value=float(s),
+            detail={"generation": generation},
+        )
 
     def _latest_current_tcp_s_if_fresh(self) -> Optional[float]:
         if self._latest_current_tcp_s is None or self._latest_current_tcp_s_receive_time_sec is None:
@@ -650,6 +769,10 @@ class InterceptionController(Node):
     def _set_state(self, state: InterceptionState, info: str = "") -> None:
         if self._state != state:
             self.get_logger().info(f"state {self._state.value} -> {state.value}: {info}")
+            self._trace(
+                "controller_state", "transition",
+                detail={"from": self._state.value, "to": state.value, "reason": info},
+            )
         self._state = state
         if info:
             self._last_info = info
@@ -912,20 +1035,34 @@ class InterceptionController(Node):
         return response
 
     def _handle_intercept_pose(self, msg: PoseStamped) -> None:
+        source_stamp_ns = (
+            int(msg.header.stamp.sec) * 1_000_000_000
+            + int(msg.header.stamp.nanosec)
+        )
+        sequence = self._trace_input("scene_input_received", source_stamp_ns)
+        self._trace_decision_start(sequence)
         if self._command_source != "scene":
+            self._trace_rejection("inactive_command_source", received_source="scene")
+            self._trace_decision_end(False, "inactive_command_source")
             return
 
         if self._state != InterceptionState.ARMED_WAITING:
             if self._execution_backend.backend_name != "cont_tracker" or not self._execution_backend.is_active():
+                self._trace_rejection("controller_not_armed", state=self._state.value)
+                self._trace_decision_end(False, "controller_not_armed")
                 return
 
         if self._state not in {InterceptionState.ARMED_WAITING, InterceptionState.EXECUTING}:
+            self._trace_rejection("controller_state_gate", state=self._state.value)
+            self._trace_decision_end(False, "controller_state_gate")
             return
 
         now_sec = self._now_sec()
 
         if self._accept_after_time_sec is not None and now_sec < self._accept_after_time_sec:
             self._debug("ignoring intercept pose during post-reset ignore window")
+            self._trace_rejection("post_reset_ignore_window")
+            self._trace_decision_end(False, "post_reset_ignore_window")
             return
 
         expected_frame = _clean_frame(str(self.get_parameter("expected_frame").value))
@@ -934,6 +1071,10 @@ class InterceptionController(Node):
             self.get_logger().warn(
                 f"ignoring intercept pose with frame_id='{msg_frame}', expected='{expected_frame}'"
             )
+            self._trace_rejection(
+                "frame_mismatch", frame_id=msg_frame, expected_frame=expected_frame
+            )
+            self._trace_decision_end(False, "frame_mismatch")
             return
 
         stamp_sec = self._stamp_to_sec(msg)
@@ -942,17 +1083,23 @@ class InterceptionController(Node):
             age = now_sec - stamp_sec
             if age > max_age:
                 self._debug(f"ignoring stale intercept pose age={age:.3f}s max={max_age:.3f}s")
+                self._trace_rejection("stale_input", age_sec=age, max_age_sec=max_age)
+                self._trace_decision_end(False, "stale_input")
                 return
 
         p = msg.pose.position
         if not all(map(lambda x: x == x and abs(x) != float("inf"), [p.x, p.y, p.z])):
             self.get_logger().warn("ignoring non-finite intercept pose")
+            self._trace_rejection("non_finite_input")
+            self._trace_decision_end(False, "non_finite_input")
             return
 
         generation = self._generation
         self._set_state(InterceptionState.PROJECTING, "projecting intercept pose to executor line")
 
         if not self._project_client.wait_for_service(timeout_sec=0.05):
+            self._trace_rejection("projection_service_unavailable")
+            self._trace_decision_end(False, "projection_service_unavailable")
             self._freeze(
                 f"projection service unavailable: {self.get_parameter('project_point_service').value}",
                 error=True,
@@ -969,6 +1116,7 @@ class InterceptionController(Node):
 
         future = self._project_client.call_async(req)
         future.add_done_callback(lambda fut: self._on_projection_done(fut, generation))
+        self._trace("projection", "submitted", detail={"generation": generation})
 
     def _handle_current_tcp_s(self, msg: Float64) -> None:
         value = float(msg.data)
@@ -983,14 +1131,25 @@ class InterceptionController(Node):
         self._latest_current_tcp_s_receive_time_sec = self._now_sec()
 
     def _handle_rollout_prediction(self, msg: Float64) -> None:
+        sequence = self._trace_input("act_rollout_prediction_received")
+        self._trace_decision_start(sequence)
         if self._command_source != "rollout":
+            self._trace_rejection("inactive_command_source", received_source="rollout")
+            self._trace_decision_end(False, "inactive_command_source")
             return
 
         if self._rollout_reset_pending or not self._rollout_predictions_accepted:
+            self._trace_rejection("rollout_reset_gate", reset_pending=self._rollout_reset_pending)
+            self._trace_decision_end(False, "rollout_reset_gate")
             return
 
         now_sec = self._now_sec()
-        if self._rollout_post_reset_guard_until_sec is not None and now_sec < self._rollout_post_reset_guard_until_sec:
+        if (
+            self._rollout_post_reset_guard_until_sec is not None
+            and now_sec < self._rollout_post_reset_guard_until_sec
+        ):
+            self._trace_rejection("post_reset_guard")
+            self._trace_decision_end(False, "post_reset_guard")
             return
 
         if self._state not in {
@@ -998,6 +1157,8 @@ class InterceptionController(Node):
             InterceptionState.SENDING_ACTION,
             InterceptionState.EXECUTING,
         }:
+            self._trace_rejection("controller_state_gate", state=self._state.value)
+            self._trace_decision_end(False, "controller_state_gate")
             return
 
         target_s_m = float(msg.data)
@@ -1007,6 +1168,8 @@ class InterceptionController(Node):
                 "ignoring non-finite rollout target scalar",
                 period_sec=1.0,
             )
+            self._trace_rejection("non_finite_prediction", probability_available=False)
+            self._trace_decision_end(False, "non_finite_prediction")
             return
 
         min_target = float(self.get_parameter("rollout_min_target_s_m").value)
@@ -1017,11 +1180,17 @@ class InterceptionController(Node):
                 "ignoring rollout prediction outside configured target_s bounds",
                 period_sec=1.0,
             )
+            self._trace_rejection(
+                "target_out_of_bounds", target_s=target_s_m,
+                minimum=min_target, maximum=max_target, probability_available=False,
+            )
+            self._trace_decision_end(False, "target_out_of_bounds")
             return
 
         self._rollout_last_valid_receive_time_sec = now_sec
         self._latest_rollout_target_s = float(target_s_m)
         self._publish_selected_goto_s(float(target_s_m), self._generation)
+        self._trace_decision_end(True)
         mode = "dry-run" if self._get_dry_run() else "live"
         self.get_logger().info(
             f"accepted rollout target_s={target_s_m:.6f} mode={mode} generation={self._generation}"
@@ -1031,6 +1200,10 @@ class InterceptionController(Node):
             return
 
         self._execution_backend.update_target(float(target_s_m), self._generation)
+        self._trace(
+            "command", "target_update_published", scalar_value=float(target_s_m),
+            detail={"backend": self._execution_backend.backend_name},
+        )
 
     def _on_projection_done(self, future: Any, generation: int) -> None:
         if generation != self._generation:
@@ -1041,22 +1214,29 @@ class InterceptionController(Node):
         try:
             result = future.result()
         except Exception as exc:
+            self._trace_rejection("projection_service_exception", error=str(exc))
+            self._trace_decision_end(False, "projection_service_exception")
             self._freeze(f"projection service call failed: {exc}", error=True)
             return
 
         if result is None:
+            self._trace_rejection("projection_no_result")
+            self._trace_decision_end(False, "projection_no_result")
             self._freeze("projection service returned no result", error=True)
             return
 
         if not bool(result.success):
             # Conservative behavior: do not freeze. Keep waiting for next valid intercept pose.
             self.get_logger().warn(f"projection rejected; waiting for next intercept pose: {result.message}")
+            self._trace_rejection("projection_rejected", service_message=str(result.message))
+            self._trace_decision_end(False, "projection_rejected")
             self._clear_projection_request_cache(generation)
             self._clear_pending_publish_data(generation)
             self._set_state(InterceptionState.ARMED_WAITING, "projection rejected; waiting again")
             return
 
         base_target_xyz = self._resolve_projection_base_target(result, generation)
+        self._trace_decision_end(True)
         self._clear_projection_request_cache(generation)
         if base_target_xyz is None:
             self._warn_throttled(
@@ -1070,6 +1250,10 @@ class InterceptionController(Node):
 
         if self._execution_backend.backend_name == "cont_tracker" and self._execution_backend.is_active():
             self._execution_backend.update_target(float(result.s), generation)
+            self._trace(
+                "command", "target_update_published", scalar_value=float(result.s),
+                detail={"backend": self._execution_backend.backend_name},
+            )
             self._clear_pending_publish_data(generation)
             self._set_state(InterceptionState.EXECUTING, f"cont_tracker update target_s={float(result.s):.6f}")
             return
@@ -1119,6 +1303,10 @@ class InterceptionController(Node):
 
         if self._execution_backend.backend_name == "cont_tracker" and self._execution_backend.is_active():
             self._execution_backend.update_target(float(s), generation)
+            self._trace(
+                "command", "target_update_published", scalar_value=float(s),
+                detail={"backend": self._execution_backend.backend_name},
+            )
             self._set_state(
                 InterceptionState.EXECUTING,
                 f"updating cont_tracker target_s={float(s):.6f}",
@@ -1176,10 +1364,13 @@ class InterceptionController(Node):
 
         self._active_command_v_max = v_max
         self._active_command_a_max = a_max
+        self._trace(
+            "command", "goto_s_submitted", scalar_value=float(s),
+            detail={"backend": self._execution_backend.backend_name, "generation": generation},
+        )
         self._execution_backend.start(GoalRequest(goal=goal, target_s=float(s), generation=generation))
 
     def on_backend_goal_accepted(self, backend_name: str, generation: int, goal_handle: Any) -> None:
-        del backend_name
         if generation != self._generation:
             self._clear_pending_publish_data(generation)
             return
@@ -1212,10 +1403,19 @@ class InterceptionController(Node):
         self._clear_pending_publish_data(generation)
 
         self._active_goal_handle = goal_handle
+        accepted_s = self._latest_selected_target_s
+        self._trace(
+            "command", "target_acceptance_acknowledged",
+            scalar_value=0.0 if accepted_s is None else float(accepted_s),
+            detail={"backend": backend_name, "generation": generation},
+        )
         self._set_state(InterceptionState.EXECUTING, "trajectory executor accepted goal")
 
     def on_backend_goal_rejected(self, backend_name: str, generation: int, reason: str) -> None:
-        del backend_name, generation
+        self._trace(
+            "command", "target_acceptance_rejected", valid=False,
+            detail={"backend": backend_name, "generation": generation, "rejection_reason": reason},
+        )
         self._clear_pending_publish_data()
         self._freeze(reason, error=True)
 
