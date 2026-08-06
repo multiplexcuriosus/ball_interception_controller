@@ -169,7 +169,7 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("max_intercept_pose_age_sec", default_value="0.25"),
             DeclareLaunchArgument("max_cross_track_error_m", default_value="0.03"),
             DeclareLaunchArgument("allow_out_of_bounds_projection", default_value="false"),
-            DeclareLaunchArgument("max_wait_after_arm_sec", default_value="5.0"),
+            DeclareLaunchArgument("max_wait_after_arm_sec", default_value="10.0"),
             DeclareLaunchArgument("post_reset_ignore_sec", default_value="0.6"),
             DeclareLaunchArgument("require_reset_service", default_value="true"),
             DeclareLaunchArgument("status_publish_rate_hz", default_value="2.0"),
